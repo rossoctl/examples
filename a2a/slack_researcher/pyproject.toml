@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11,<3.13"
 description = "Slack research Agent module"
 dependencies = [
-    "ag2[openai,mcp]>=0.14.0",
+    "ag2[openai,mcp]>=1.0.0",
     "tavily-python>=0.7.26",
     "python-dotenv>=1.2.2",
     "a2a-sdk[http-server]>=1.1.0",
