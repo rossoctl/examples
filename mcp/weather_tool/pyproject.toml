@@ -9,11 +9,11 @@ dependencies = [
     "authlib>=1.7.2",   # Indirect; prevents CVE-2026-27962
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
     "python-multipart>=0.0.32", # Indirect; prevents CVE-2026-24486
-    "fastmcp>=3.4.4",           # Indirect; prevents CVE-2026-32871
+    "fastmcp>=3.4.5",           # Indirect; prevents CVE-2026-32871
     "uvicorn>=0.51.0",
     "cryptography>=49.0.0,<50", # Indirect; prevents CVE-2026-26007
     "starlette>=1.3.1",        # Indirect; prevents CVE-2025-62727
-    "opentelemetry-api>=1.43.0",
+    "opentelemetry-api>=1.44.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-http>=1.42.1",
 ]
