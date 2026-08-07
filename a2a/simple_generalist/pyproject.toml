@@ -10,8 +10,8 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
-    "uvicorn>=0.51.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.43.0",
+    "uvicorn>=0.52.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
     "urllib3>=2.7.0",            # Indirect; prevents CVE-2026-44431, CVE-2026-44432
     "python-multipart>=0.0.32",  # Indirect; prevents CVE-2026-24486
 ]
