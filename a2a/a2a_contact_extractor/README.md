@@ -74,6 +74,6 @@ with a validator to render things nicely if you want and maybe serialize weird t
 
 ## Learn More
 
--   [Marvin Documentation](https://www.askmarvin.ai/)
+-   [Marvin Documentation](https://marvin.mintlify.app)
 -   [Marvin GitHub Repository](https://github.com/prefecthq/marvin)
 -   [A2A Protocol Documentation](https://a2a-protocol.org/latest/)
