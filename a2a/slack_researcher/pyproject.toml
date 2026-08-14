@@ -5,7 +5,7 @@ requires-python = ">=3.11,<3.13"
 description = "Slack research Agent module"
 dependencies = [
     "ag2[openai,mcp]>=0.14.0",
-    "tavily-python>=0.7.26",
+    "tavily-python>=0.7.27",
     "python-dotenv>=1.2.2",
     "a2a-sdk[http-server]>=1.1.0",
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
