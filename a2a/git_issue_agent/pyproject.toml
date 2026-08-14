@@ -5,18 +5,18 @@ requires-python = ">=3.11,<3.13"
 description = "Git issue Agent module"
 dependencies = [
     "python-dotenv>=1.2.2",
-    "a2a-sdk>=1.1.0,<2",
+    "a2a-sdk>=1.1.2,<2",
     # We use 1.6.1 instead of the latest because
     # crewai requires openai>=2.30.0
     # but litellm requires openai==2.24.0
     "crewai[litellm]>=1.15.2",
-    "litellm>=1.91.1",          # Indirect, prevents CVE-2026-42271
+    "litellm>=1.96.0",          # Indirect, prevents CVE-2026-42271
     "crewai-tools[mcp]>=1.15.2",
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
     "python-multipart>=0.0.32", # Indirect; prevents CVE-2026-24486
     "cryptography>=49.0.0,<50", # Indirect; prevents CVE-2026-26007
     "pyasn1>=0.6.4",            # Indirect; prevents CVE-2026-30922
-    "starlette>=1.3.1",        # Indirect; prevents CVE-2025-62727
+    "starlette>=1.6.0",        # Indirect; prevents CVE-2025-62727
     "pillow>=12.3.0",           # Indirect; prevents CVE-2026-40192
     "lxml>=6.1.1",              # Indirect; prevents CVE-2026-41066
     "orjson>=3.11.6",           # Indirect; prevents CVE-2025-67221
