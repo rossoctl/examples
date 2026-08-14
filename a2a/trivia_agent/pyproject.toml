@@ -6,10 +6,10 @@ license = { text = "Apache" }
 requires-python = ">=3.11"
 dependencies = [
     "a2a-sdk[http-server]>=1.1.0",
-    "openai>=2.45.0",
-    "pydantic-settings>=2.14.2",
-    "uvicorn>=0.51.0",
-    "opentelemetry-exporter-otlp>=1.43.0",
+    "openai>=2.53.0",
+    "pydantic-settings>=2.15.0",
+    "uvicorn>=0.52.1",
+    "opentelemetry-exporter-otlp>=1.44.0",
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2026-44431, CVE-2026-44432
     "pyasn1>=0.6.4",    # Indirect; prevents CVE-2026-30922
 ]
