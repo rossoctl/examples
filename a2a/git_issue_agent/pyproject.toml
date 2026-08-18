@@ -9,7 +9,7 @@ dependencies = [
     # We use 1.6.1 instead of the latest because
     # crewai requires openai>=2.30.0
     # but litellm requires openai==2.24.0
-    "crewai[litellm]>=1.15.2",
+    "crewai[litellm]>=1.15.3",
     "litellm>=1.91.1",          # Indirect, prevents CVE-2026-42271
     "crewai-tools[mcp]>=1.15.2",
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
