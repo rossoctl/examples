@@ -9,7 +9,7 @@ readme = "README.md"
 license = { text = "Apache" }
 requires-python = ">=3.11"
 dependencies = [
-    "a2a-sdk[http-server]>=1.1.0,<2",
+    "a2a-sdk[http-server]>=1.1.1,<2",
     "langgraph>=1.2.9",
     "langchain-core>=1.4.9",
     "langchain-community>=0.4.2",
