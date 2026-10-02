@@ -125,6 +125,15 @@ def purge(k: Kubectl, c: Checks, ns: str, *, assume_yes: bool) -> None:
         f"ns/{ns}: deploy/eventbridge, deploy/eventrunner, svc/eventbridge, "
         f"route/eventbridge, scaledobject/eventrunner, configmap/eventing-config",
         f"ns/{ns}: secret/anthropic-credentials (if present)",
+        # eventbridge-ntfy was listed nowhere and so survived --purge, which means a
+        # "purged" namespace kept a capability that lets anyone who learns it read and
+        # publish your notifications.
+        f"ns/{ns}: secret/eventbridge-ntfy (if present)",
+        # §11 — the private keys. Leaving these behind means a later deploy silently
+        # inherits an identity the operator thought they had destroyed.
+        f"ns/{ns}: secret/eventbridge-signing-key, secret/eventrunner-signing-key "
+        f"(PRIVATE KEYS, if present)",
+        f"ns/{ns}: configmap/eventing-keyset (the approved-agent list, if present)",
         f"ns/{ns}: pvc/eventbridge-data AND ITS CONTENTS (if present)",
         f"ns/{KAFKA_NS}: kafkatopic/{ns}-requests AND ALL ITS MESSAGES",
         f"ns/{KAFKA_NS}: kafkatopic/{ns}-responses AND ALL ITS MESSAGES",
@@ -145,7 +154,11 @@ def purge(k: Kubectl, c: Checks, ns: str, *, assume_yes: bool) -> None:
                        ("deploy", "eventrunner"), ("deploy", "eventbridge"),
                        ("svc", "eventbridge"), ("route", "eventbridge"),
                        ("configmap", "eventing-config"),
+                       ("configmap", "eventing-keyset"),
                        ("secret", "anthropic-credentials"),
+                       ("secret", "eventbridge-ntfy"),
+                       ("secret", "eventbridge-signing-key"),
+                       ("secret", "eventrunner-signing-key"),
                        ("pvc", "eventbridge-data")):
         c.expect_run(k.delete(kind, name, namespace=ns), f"deleted {kind}/{name} from {ns}")
     for topic in (f"{ns}-requests", f"{ns}-responses"):
