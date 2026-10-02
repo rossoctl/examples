@@ -92,21 +92,85 @@ GROUP_REGEX = CORR_REGEX
 
 class Handlers:
     def __init__(self, cfg: Cfg, store: Store, producer: Producer, minter: Minter,
-                 groups=None) -> None:
+                 groups=None, registry=None) -> None:
         self.cfg = cfg
         self.store = store
         self.producer = producer
         self.minter = minter
         self.groups = groups
+        # §2.5 — the approved-user registry, or None in single-tenant mode, where there
+        # is nothing to look a caller up in.
+        self.registry = registry
         # One cache for the process, so a burst of requests from the same user
         # costs one GitHub call rather than one each.
         self.logins = ghauth.LoginCache(cfg.github_cache_ttl_s)
 
+    def _agent_for(self, caller, body) -> str | None:
+        """§5.1's resolution order, for the part EventBridge controls.
+
+        The request may name an agent, otherwise the registry's default for this user.
+        Anything below that (`ER_AGENT_NAME`, then `default`) is the runner's decision
+        and is deliberately not second-guessed here — EventBridge does not know which
+        specs a given runner image has baked in.
+        """
+        if named := (body or {}).get("agent"):
+            return str(named).strip() or None
+        if self.registry is not None and caller.userid:
+            user = self.registry.by_userkey(caller.userkey) if caller.userkey else None
+            if user and user.agent:
+                return user.agent
+        return None
+
+    def _caller(self, environ):
+        """§2.4: resolve the caller once, carrying the tenancy key.
+
+        In `single` mode this is Phase 2's `auth.resolve` with the key left `None`, so
+        `ce_userkey` never reaches the wire and behaviour is unchanged.
+        """
+        return auth.resolve_caller(environ, self.cfg, cache=self.logins,
+                                   registry=self.registry)
+
+    def _owner_userkey(self, correlationid: str) -> str | None:
+        """Which tenant owns this correlation, for a `/continue` turn.
+
+        `None` in single-tenant mode, where topics do not depend on it.
+
+        `/continue` is still unauthenticated here — Phase 2 §3.1's capability-URL
+        design — so this resolves the owner from what was *recorded at submit time*
+        rather than from the caller. The turn therefore reaches the right tenant's
+        runner, which is what stops a resume from being executed under another user's
+        credential. It does NOT yet check that the caller is that owner: owner-scoped
+        reads and `?k=` capability keys are §6.2/§4.4 (T7/T9, rollout step 5), and until
+        they land `multi` mode's `/continue` is as open as Phase 2's.
+
+        The lookup goes through the recorded submitter rather than a
+        `correlationid -> userkey` index because that index is T5's global table, which
+        does not exist yet. When it does, this becomes one indexed `SELECT` and the
+        derivation here goes away — §2.6 is explicit that the index has to exist anyway,
+        for the uniqueness guarantee that keeps `sessionuuid` unsalted.
+        """
+        if not self.cfg.topics.multi:
+            return None
+        prompts = self.store.get_prompts(correlationid) or []
+        for p in prompts:
+            if submitter := p.get("submitter"):
+                # The issuer is not recorded alongside the submitter today, so this
+                # cannot distinguish a GitHub `alice` from a static `alice`. In `multi`
+                # mode anonymous and static submissions are already refused at the
+                # submit path (§2.4), so GitHub is the only issuer that reaches here —
+                # stated rather than assumed, because the day an OIDC issuer is wired
+                # up (§2.4's slot) this becomes wrong and has to move to the index.
+                if user := (self.registry.lookup("github", submitter)
+                            if self.registry else None):
+                    return user.userkey
+        return None
+
     # ---- start ----
     def start_agent(self, environ, start_response, **_):
-        submitter, sub_iss, status, why = auth.resolve(environ, self.cfg, cache=self.logins)
+        caller, status, why = self._caller(environ)
         if status:
             return _deny(start_response, why, status)
+        submitter, sub_iss = caller.userid, caller.submitter_iss
         body = _read_json(environ)
         prompt = body.get("prompt")
         if not prompt:
@@ -131,10 +195,12 @@ class Handlers:
             prompt=prompt, correlationid=corr, sessionuuid=sess,
             mode="start", model=model, max_turns=max_turns, subject="start",
             groupid=groupid, submitter=submitter, submitter_iss=sub_iss,
+            userkey=caller.userkey, agent=self._agent_for(caller, body),
         )
         out = {
             "correlationid": corr, "sessionuuid": sess,
-            "event_id": event_id, "topic": self.cfg.request_topic,
+            "event_id": event_id,
+            "topic": self.cfg.topics.requests(caller.userkey),
             "html_url": f"{self.cfg.public_base_url}/v0/agents/{corr}",
         }
         if groupid:
@@ -151,9 +217,10 @@ class Handlers:
         the batch scale at all: every request is published before any is watched, so
         lag reaches N and KEDA scales past one pod.
         """
-        submitter, sub_iss, status, why = auth.resolve(environ, self.cfg, cache=self.logins)
+        caller, status, why = self._caller(environ)
         if status:
             return _deny(start_response, why, status)
+        submitter, sub_iss = caller.userid, caller.submitter_iss
         if self.groups is None:
             return _json(start_response, "503 Service Unavailable",
                          {"error": "group support not enabled"})
@@ -189,7 +256,8 @@ class Handlers:
         corrs = self.groups.submit_members(
             groupid, [str(x) for x in prompts],
             max_turns=int(body.get("max_turns", 3)), model=body.get("model"),
-            submitter=submitter, submitter_iss=sub_iss)
+            submitter=submitter, submitter_iss=sub_iss,
+            userkey=caller.userkey, agent=self._agent_for(caller, body))
         return _json(start_response, "202 Accepted", {
             "groupid": groupid, "created": True, "expected": expected or len(corrs),
             "members": corrs,
@@ -306,6 +374,7 @@ class Handlers:
         event_id = self.producer.publish_request(
             prompt=prompt, correlationid=correlationid, sessionuuid=sess,
             mode="continue", subject="resume",
+            userkey=self._owner_userkey(correlationid),
         )
         next_seq = len(self.store.events_for(correlationid)) + 1
         return _json(start_response, "202 Accepted", {
@@ -328,6 +397,7 @@ class Handlers:
                 self.producer.publish_request(
                     prompt=prompt, correlationid=correlationid, sessionuuid=sess,
                     mode="continue", subject="resume",
+                    userkey=self._owner_userkey(correlationid),
                 )
         start_response("303 See Other", [("Location", f"/v0/agents/{correlationid}")])
         return [b""]

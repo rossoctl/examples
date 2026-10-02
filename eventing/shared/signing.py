@@ -192,7 +192,21 @@ SIGNED_ATTRS = ("specversion", "type", "source", "id", "time", "subject",
                 # signature says nothing about which batch an event belongs to, so a
                 # forged `groupid` could move a response into another batch and
                 # corrupt its fan-in counts.
-                "submitter", "submitteriss", "groupid")
+                "submitter", "submitteriss", "groupid",
+                # Phase 3 §2.6 and §7.7, added together in ONE change — §8.3's rule.
+                # Adding an attribute changes canonicalisation, so a signer and a
+                # verifier on different versions disagree about every signature;
+                # splitting this into two commits would invalidate canonicalisation
+                # twice for no benefit. Deployments with signing already enabled must
+                # upgrade both services together. With signing off (the default) there
+                # is nothing to coordinate, which is most deployments.
+                #
+                # Both have to be here rather than merely present on the event:
+                # `userkey` decides which store a response is written into and which
+                # ntfy topic announces it, so a mutable one lets anything with topic
+                # write access file events into another user's history. `depth` is the
+                # hop limit, and a resettable hop limit does not limit hops.
+                "userkey", "depth")
 
 
 def data_bytes(data: Any) -> bytes:

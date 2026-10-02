@@ -35,7 +35,7 @@ import threading
 
 from kafka import KafkaConsumer, TopicPartition
 
-from shared import ce
+from shared import ce, tenancy
 
 
 def _log(msg: str) -> None:
@@ -46,10 +46,22 @@ class GroupMirror(threading.Thread):
     """One-shot catch-up scan of the responses topic, rebuilding group state."""
 
     def __init__(self, bootstrap: str, response_topic: str, groups,
-                 metadata_tries: int = 20, max_empty_polls: int = 15) -> None:
+                 metadata_tries: int = 20, max_empty_polls: int = 15,
+                 topics: tenancy.TopicSet | None = None,
+                 userkeys: tuple[str, ...] = ()) -> None:
         super().__init__(daemon=True, name="kafka-group-mirror")
         self._bootstrap_servers = bootstrap
-        self._topic = response_topic
+        # §3.2: unlike the live consumers this one is one-shot at startup, so it "can
+        # take the full list directly" — there is no new-user race to lose, because a
+        # user who did not exist when it ran has no group history to rebuild.
+        self._topics = topics or tenancy.TopicSet(
+            "", response_topic=response_topic, request_topic="")
+        if self._topics.multi:
+            self._all_topics = tuple(self._topics.responses(uk) for uk in userkeys)
+        else:
+            self._all_topics = (self._topics.responses(),)
+        # Kept for the log lines and the single-topic metadata path below.
+        self._topic = self._all_topics[0] if self._all_topics else response_topic
         self._groups = groups
         # Partitions are assigned by hand and nothing is ever committed: the whole
         # point is to re-read from the beginning on every start, which the live
@@ -67,14 +79,25 @@ class GroupMirror(threading.Thread):
 
     def _partitions(self, c):
         """Topic metadata is fetched lazily, so the first call can legitimately return
-        None. Retry briefly rather than concluding the topic is empty."""
-        for _ in range(self._metadata_tries):
-            parts = c.partitions_for_topic(self._topic)
-            if parts:
-                return [TopicPartition(self._topic, p) for p in sorted(parts)]
-            if self._stopping.wait(0.5):
-                return []
-        return []
+        None. Retry briefly rather than concluding the topic is empty.
+
+        With several topics (multi mode) the retry is over the whole set, and a topic
+        that never resolves is skipped with a log line rather than failing the rebuild:
+        one tenant whose topic has not been provisioned yet must not cost every other
+        tenant their group history."""
+        found: list[TopicPartition] = []
+        for topic in self._all_topics:
+            for _ in range(self._metadata_tries):
+                parts = c.partitions_for_topic(topic)
+                if parts:
+                    found += [TopicPartition(topic, p) for p in sorted(parts)]
+                    break
+                if self._stopping.wait(0.5):
+                    return found
+            else:
+                if len(self._all_topics) > 1:
+                    _log(f"no metadata for {topic!r}; skipping it")
+        return found
 
     def run(self) -> None:
         # No consumer group: we assign every partition by hand. A group would make this

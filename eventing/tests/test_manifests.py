@@ -138,6 +138,83 @@ def test_no_credential_is_ever_rendered_into_a_manifest():
             assert marker not in rendered, f"{overlay} may leak a credential ({marker!r})"
 
 
+#: Phase 3 §8.3, continuing Phase 2 §5's rule. Every variable naming a path that
+#: contains key material must come from a **Secret** mount, never from the committed
+#: `config.toml` and never with a literal value in a ConfigMap. The rule is only worth
+#: having if a test enforces it, which is T22.
+#:
+#: NOTE: none of these are read by `config.py` yet — they arrive with T8 (transcript
+#: auth), T9 (capability keys), T10 (derived ntfy topics) and T16 (webhook ingress). They
+#: are listed now on purpose, so the guard is already in place when the variable lands
+#: rather than being remembered afterwards. `test_every_phase3_variable_is_classified`
+#: deliberately does NOT require these to be read, which is why it only asserts the
+#: ConfigMap side against live code.
+SECRET_PATH_VARS = (
+    "EB_NTFY_TOPIC_SECRET_PATH",
+    "EB_CAPABILITY_SECRET_PATH",
+    "EB_WEBHOOK_SECRETS_PATH",
+)
+
+#: The other side of the same rule: these record what an operator approved and grant
+#: nothing, so a ConfigMap (or an image path) is correct and a Secret would be cargo
+#: cult. Listed explicitly so the next variable added lands on one side deliberately.
+CONFIGMAP_VARS = (
+    "EB_TENANCY_MODE",
+    "EB_TOPIC_PREFIX",
+    "EB_USER_REGISTRY_PATH",
+    "ER_AGENT_DIR",
+    "ER_AGENT_NAME",
+    "ER_USERKEY",
+)
+
+
+def test_secret_path_variables_are_never_set_from_the_committed_config():
+    """A seed path in `config.toml` means the whole signing/notification block can be
+    half-configured from a file in git."""
+    toml = (ROOT / "eventbridge" / "config.toml").read_text()
+    for var in SECRET_PATH_VARS:
+        assert var not in toml, f"{var} must be env-only (DESIGN_PHASE3.md §8.3)"
+        # The TOML spelling of the same thing — a lower-cased key without the prefix.
+        key = var.removeprefix("EB_").lower()
+        assert key not in toml, f"{key} in config.toml reintroduces {var} by another name"
+
+
+@needs_kubectl
+def test_no_phase3_secret_is_inlined_into_a_manifest():
+    """The §8.3 rule, checked where it would actually leak: rendered output."""
+    for overlay in OVERLAYS:
+        rendered = render(overlay)
+        for var in SECRET_PATH_VARS:
+            # Referencing the variable is fine; giving it a literal sibling value is
+            # not. A `secretKeyRef` has no `value:` on the same key.
+            for bad in (f"{var}:", f"name: {var}\n          value:"):
+                assert bad not in rendered, \
+                    f"{overlay} appears to inline {var} rather than mounting a Secret"
+
+
+def test_every_phase3_variable_is_classified():
+    """A variable that is in neither list is one nobody decided about.
+
+    §8.3's rule only works if adding a variable forces the Secret-vs-ConfigMap question,
+    so this asserts the two lists together cover what `config.py` actually reads.
+    """
+    import re as _re
+    sources = [(ROOT / "eventbridge" / "config.py").read_text(),
+               (ROOT / "eventrunner" / "config.py").read_text()]
+    found = set()
+    for src in sources:
+        found |= set(_re.findall(r'e\("((?:EB|ER)_[A-Z0-9_]+)"', src))
+    # Every ConfigMap-side variable must actually be read by the code — a stale entry
+    # here would silently stop checking anything. The Secret-side ones are deliberately
+    # exempt: they are declared ahead of the tasks that introduce them (see the note on
+    # SECRET_PATH_VARS), and requiring them now would just force a placeholder read.
+    for var in CONFIGMAP_VARS:
+        assert var in found, f"{var} is listed here but no config.py reads it"
+    # The sanity check that this test is looking at the right thing at all.
+    assert "EB_TENANCY_MODE" in found and len(found) > 10, \
+        "config.py does not look like it was parsed; did the `e(\"VAR\")` idiom change?"
+
+
 @needs_kubectl
 def test_the_demo_overlay_requires_the_credential_secret():
     doc = find_doc(render("demo"), "Deployment", "eventrunner")
