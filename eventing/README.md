@@ -183,6 +183,29 @@ the full list of what stays open: `agentdocs/README_PHASE1.md` §
 "Submit-path authentication".
 
 Two of these are load-bearing in ways that are easy to miss.
+Added in Phase 3 (`agentdocs/DESIGN_PHASE3.md`). Only the variables whose code is
+actually in the tree — §9's steps 1–4. Every one of them is off or single-tenant by
+default, so an existing deployment that upgrades and changes nothing behaves exactly
+as it did:
+
+| Env | Default | Effect |
+|---|---|---|
+| `EB_TENANCY_MODE` | `single` | `single` reproduces Phase 2: one topic pair, one store, no ownership checks. `multi` switches on per-user topics and requires an authenticated, registered caller |
+| `EB_TOPIC_PREFIX` | `kev1` | First component of every per-user topic name, `{prefix}-{userkey}-requests`. Unused in `single` mode |
+| `EB_USER_REGISTRY_PATH` | — | The approved-user registry (a ConfigMap, §2.5). **Required in `multi` mode, and an empty one denies everyone** — the other reading turns a missing file into an open door |
+| `ER_USERKEY` | — | Which tenant this runner serves. Stamped on every response so EventBridge can file it. **Required once `REQUEST_TOPIC` is not `requests`**; the runner refuses to start otherwise |
+| `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2) |
+| `ER_AGENT_NAME` | `default` | Fallback agent when neither the request nor the registry names one. `default` with no file on disk is Phase 2's argv exactly |
+
+Two notes on these. **`multi` mode is not yet isolation you should present as such** —
+per-user *stores*, owner-scoped reads and transcript authentication are steps 5–8 and
+are not implemented, so in `multi` mode the HTTP reads and `/continue` are still as open
+as Phase 2's. And even once they land, separate topics without Kafka ACLs are
+*organisation*, not isolation; `DESIGN_PHASE3.md` §3.6 and §10 are explicit about which
+claim each configuration earns. **Adding a user is an operator action**: EventBridge has
+no Kubernetes client and will not create topics, so a registry entry whose topics do not
+exist is a refusal, not an auto-provision.
+
 `ER_EVENTBRIDGE_URL` is what makes `/continue` survive a scale-to-zero *and* what
 keeps event `sequence` numbers unique across pods — without it a second pod
 restarts numbering at 1 and its rows overwrite the first turn's.
