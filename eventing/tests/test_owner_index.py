@@ -8,6 +8,7 @@ pass through silently — which is the failure the whole guarantee exists to pre
 """
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
@@ -209,6 +210,41 @@ def test_remember_is_a_noop_once_an_index_is_configured(idx):
 
 
 # ---- mint_for's compatibility shim ---------------------------------------
+
+def test_a_broken_index_surfaces_instead_of_exhausting_the_id_space(idx):
+    """Regression. `except Exception` around `claim` meant a genuinely broken index
+    (disk full, database locked, schema missing) was retried 2000 times and surfaced as
+    `RuntimeError: correlation ID space exhausted` — a message that sends the reader to
+    the word lists rather than the database."""
+    class BrokenIndex:
+        def exists(self, corr):
+            return False
+
+        def claim(self, corr, userkey):
+            raise sqlite3.OperationalError("database or disk is full")
+
+    m = Minter(index=BrokenIndex())
+    with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+        m.mint(userkey=A)
+
+
+def test_a_lost_race_is_still_retried_not_raised(idx):
+    """The Collision path must stay a retry: a concurrent winner is normal."""
+    class RacyOnce:
+        def __init__(self):
+            self.calls = 0
+
+        def exists(self, corr):
+            return False
+
+        def claim(self, corr, userkey):
+            self.calls += 1
+            if self.calls == 1:
+                raise Collision("lost the race")
+
+    m = Minter(index=RacyOnce())
+    assert m.mint(userkey=A)        # second candidate succeeds
+
 
 def test_mint_for_passes_the_userkey_when_supported(idx):
     m = Minter(index=idx)

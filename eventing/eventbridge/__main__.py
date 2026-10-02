@@ -166,7 +166,9 @@ def main() -> int:
     # emptyDir /data) served 404 for every earlier group even though its notifications
     # had already gone out. One-shot, never publishes, never notifies.
     group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups,
-                               topics=topics)
+                               topics=topics,
+                               userkeys=users.userkeys if topics.multi else (),
+                               owners=owners if topics.multi else None)
     group_mirror.start()
 
     h = Handlers(cfg, store, producer, minter, groups=groups,

@@ -6,6 +6,8 @@ import random
 import re
 import threading
 
+from eventbridge.owner_index import Collision
+
 REGEX = re.compile(r"^[a-z]{3,10}-[a-z]{3,12}-\d{4}$")
 
 
@@ -77,7 +79,15 @@ class Minter:
                 continue
             try:
                 self._index.claim(candidate, userkey)
-            except Exception:  # noqa: BLE001 - a lost race is a retry, not a failure
+            except Collision:
+                # Another worker won this id between `exists` and `claim`. That is a
+                # retry, not a failure.
+                #
+                # Deliberately NOT `except Exception`: a genuinely broken index (disk
+                # full, database locked, schema missing) would then be retried 2000 times
+                # and surface as `RuntimeError("correlation ID space exhausted")`, which
+                # sends the reader to the word lists instead of the database. A real
+                # failure belongs to the caller.
                 continue
             return candidate
         raise RuntimeError("correlation ID space exhausted")
