@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "google-search-results>=2.4.2",
     "requests>=2.34.2",
-    "fastmcp>=3.4.4",           # Indirect; prevents CVE-2026-32871
+    "fastmcp>=3.4.7",           # Indirect; prevents CVE-2026-32871
 ]
 
 [tool.setuptools]
