@@ -147,14 +147,31 @@ class StoreRegistry:
     # ---- eviction -----------------------------------------------------------
 
     def _evict_if_needed(self, protect: str | None = None) -> None:
-        """Close least-recently-used stores until the cache fits. Caller holds the lock.
+        """Evict least-recently-used stores until the cache fits. Caller holds the lock.
 
-        Two things are never evicted: `protect` (the store the current caller is about to
-        use) and any store with live SSE subscribers. If everything left is pinned the
-        cache is allowed to exceed `max_open` rather than breaking a live viewer — going
-        over a soft descriptor budget degrades and is visible in `/healthz`, while
-        evicting a subscribed store silently stops a page from updating. The first is
-        recoverable, the second is not.
+        **Eviction drops the registry's reference; it does NOT close the store.** That
+        distinction is the whole correctness argument, and closing here was a real
+        use-after-close bug: a handler resolves a store, and while it is still making
+        calls on it a *concurrent request for a different tenant* pushes the cache over
+        its ceiling and closes it underneath. The next call fails with
+        `sqlite3.ProgrammingError: Cannot operate on a closed database`, from a line that
+        looks nothing to do with caching. Every multi-call read path was exposed —
+        `get_html` alone makes five calls on one store — so pinning the SSE path only
+        would have fixed the case that was easiest to see, not the class.
+
+        Dropping the reference instead means CPython closes the connections when the last
+        holder goes away, which is exactly the lifetime that is safe. The file descriptors
+        are reclaimed slightly later than an explicit close, and that is the right trade:
+        the ceiling is a soft budget, while a closed connection under an in-flight request
+        is a 500.
+
+        Two things are never evicted even in this weaker sense: `protect` (the store the
+        current caller is about to use) and any store with live SSE subscribers. A
+        subscribed store is kept in the cache so a later reader gets the SAME object and
+        therefore sees the subscriber's notifications; evicting it would leave the viewer
+        watching an object nothing writes to any more — updates stop with no error, which
+        is the Phase 2 §6.1 symptom class. If everything left is pinned the cache exceeds
+        `max_open` rather than breaking a viewer.
         """
         if len(self._open) <= self._max_open:
             return
@@ -163,14 +180,10 @@ class StoreRegistry:
                 break
             if key == protect:
                 continue
-            store = self._open[key]
-            if _has_subscribers(store):
+            if _has_subscribers(self._open[key]):
                 continue
+            # Reference dropped, not closed. See the docstring.
             del self._open[key]
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001 - a failed close must not fail a request
-                pass
             self.evictions += 1
 
     # ---- lifecycle ----------------------------------------------------------

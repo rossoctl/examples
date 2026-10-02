@@ -596,20 +596,31 @@ class Handlers:
         store = self._store_of(correlationid)
         if store is None:
             return
-        events = store.events_for(correlationid, since_seq=since_seq)
-        seen_final = False
-        for e in events:
-            yield f"data: {json.dumps(e)}\n\n".encode()
-            sent = max(sent, e["sequence"])
-            if e.get("final"):
-                seen_final = True
-        if seen_final:
-            # Nothing more to stream — connection closes cleanly instead of
-            # holding open and waiting for events that will never arrive.
-            return
 
+        # SUBSCRIBE FIRST, before the replay. The registry pins a store only while it has
+        # subscribers, so between `_store_of` and `subscribe` this store is evictable —
+        # and another request for a different tenant can close it underneath us, making
+        # the replay below fail with `sqlite3.ProgrammingError: Cannot operate on a closed
+        # database`. Subscribing first closes that window: from here until the `finally`
+        # the store cannot be evicted.
+        #
+        # Subscribing before the replay is also harmless for correctness: `ev` only ever
+        # means "there may be something new", every read is `since_seq=sent`, and a set
+        # Event simply costs one extra query.
         ev = store.subscribe(correlationid)
         try:
+            events = store.events_for(correlationid, since_seq=since_seq)
+            seen_final = False
+            for e in events:
+                yield f"data: {json.dumps(e)}\n\n".encode()
+                sent = max(sent, e["sequence"])
+                if e.get("final"):
+                    seen_final = True
+            if seen_final:
+                # Nothing more to stream — connection closes cleanly instead of
+                # holding open and waiting for events that will never arrive.
+                return
+
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 if ev.wait(timeout=15.0):
