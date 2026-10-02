@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 
+from eventbridge import registry
 from eventbridge.config import load
 from eventbridge.correlation import Minter
 from eventbridge.group_service import GroupService
@@ -76,11 +77,50 @@ def main() -> int:
         print("[eventbridge] response verification OFF "
               "(set EB_VERIFY_KEYSET_PATH to enable)")
 
+    # Phase 3 §3.2: one TopicSet, built once here and handed to everything that names a
+    # topic, so §3.1's layout appears exactly once in the codebase. In `single` mode
+    # every method returns the configured request/response topic, which is what makes
+    # this step a pure refactor — the existing suite is the check.
+    topics = cfg.topics
+    print(f"[eventbridge] tenancy={cfg.tenancy_mode}"
+          + (f" prefix={cfg.topic_prefix}" if topics.multi else
+             f" requests={cfg.request_topic} responses={cfg.response_topic}"))
+
+    # §2.5 — a bad registry must stop startup, but as a readable refusal rather than a
+    # traceback: this is an operator-facing configuration error, and the message (which
+    # names both the recorded and the derived userkey) is the whole point. A traceback
+    # buries it under frames nobody reading `kubectl logs` needs.
+    try:
+        users = registry.load(cfg.user_registry_path)
+    except registry.RegistryError as e:
+        raise SystemExit(f"[eventbridge] user registry: {e}") from None
+    if topics.multi:
+        if not cfg.user_registry_path:
+            raise SystemExit(
+                "[eventbridge] EB_TENANCY_MODE=multi requires EB_USER_REGISTRY_PATH. "
+                "Per-user isolation has no meaning without a list of users to isolate. "
+                "See DESIGN_PHASE3.md §2.5.")
+        if not len(users):
+            # Phase 2 §2.4's reading, for Phase 2's reason: the other one turns a
+            # missing file into an open door.
+            raise SystemExit(
+                f"[eventbridge] the user registry at {cfg.user_registry_path} approves "
+                f"nobody. An empty registry denies everyone; add a user or run with "
+                f"EB_TENANCY_MODE=single.")
+        print(f"[eventbridge] registry: {len(users)} user(s) — "
+              f"{', '.join(users.userkeys)}")
+    elif len(users):
+        # Harmless, but worth saying: a registry that is loaded and ignored is usually
+        # somebody who set the path and forgot the mode.
+        print(f"[eventbridge] registry has {len(users)} user(s) but "
+              f"EB_TENANCY_MODE=single, so it is not consulted")
+
     # The producer needs the RESPONSES topic too: group lifecycle events go there,
     # not on requests, because EventRunner would try to execute anything on requests.
     producer = Producer(cfg.kafka_bootstrap, cfg.request_topic, cfg.source_uri,
                         response_topic=cfg.response_topic,
-                        seed=seed, kid=cfg.signing_kid or None)
+                        seed=seed, kid=cfg.signing_kid or None,
+                        topics=topics)
     groups = GroupService(cfg, store, producer, minter)
 
     ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store)
@@ -93,22 +133,26 @@ def main() -> int:
                         on_member_event=groups.on_member_event,
                         keyset=ks,
                         require_signature=cfg.require_response_signature,
-                        bridge_kid=cfg.signing_kid or None)
+                        bridge_kid=cfg.signing_kid or None,
+                        topics=topics)
     consumer.start()
 
     # Back-fill prompts from the requests topic — also gives us prompt visibility
     # for correlations we didn't originate ourselves.
-    requests_mirror = RequestsMirror(cfg.kafka_bootstrap, cfg.request_topic, store)
+    requests_mirror = RequestsMirror(cfg.kafka_bootstrap, cfg.request_topic, store,
+                                     topics=topics)
     requests_mirror.start()
 
     # §21.2: rebuild group history from the responses topic. The live consumer above
     # commits offsets and so never re-reads, which meant a restarted pod (with an
     # emptyDir /data) served 404 for every earlier group even though its notifications
     # had already gone out. One-shot, never publishes, never notifies.
-    group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups)
+    group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups,
+                               topics=topics)
     group_mirror.start()
 
-    h = Handlers(cfg, store, producer, minter, groups=groups)
+    h = Handlers(cfg, store, producer, minter, groups=groups,
+                 registry=users if topics.multi else None)
     dsp = Dispatcher()
     dsp.add("POST", r"/v0/agents",                                          h.start_agent)
     dsp.add("POST", r"/v0/agents/(?P<correlationid>[a-z0-9-]+)/continue",   h.continue_agent)

@@ -81,7 +81,12 @@ def main() -> int:
               "set ER_VERIFY_KEYSET_PATH for an approved-agent list")
 
     emitter = Emitter(cfg.kafka_bootstrap, cfg.response_topic, cfg.source_uri,
-                      seed=seed, kid=cfg.signing_kid or None)
+                      seed=seed, kid=cfg.signing_kid or None,
+                      userkey=cfg.userkey or None)
+    # Phase 3 §3.3/§5.1. Printed because both are silent otherwise: a runner serving the
+    # wrong tenant and a runner running the wrong agent both look like working pods.
+    print(f"[eventrunner] tenancy={'userkey=' + cfg.userkey if cfg.userkey else 'single'} "
+          f"agent={cfg.agent_name} agent_dir={cfg.agent_dir}")
 
     def _run(event):
         run_agent(cfg, emitter, event, transcripts=transcripts)

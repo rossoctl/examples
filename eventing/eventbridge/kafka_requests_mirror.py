@@ -20,15 +20,22 @@ import threading
 from kafka import KafkaConsumer
 
 from eventbridge.store import Store
-from shared import ce
+from shared import ce, tenancy
 
 
 class RequestsMirror(threading.Thread):
     def __init__(self, bootstrap: str, request_topic: str, store: Store,
-                 group_id: str | None = None) -> None:
+                 group_id: str | None = None,
+                 topics: tenancy.TopicSet | None = None) -> None:
         super().__init__(daemon=True, name="kafka-requests-mirror")
         self._bootstrap_servers = bootstrap
-        self._topic = request_topic
+        # §3.2: "RequestsMirror needs the same treatment" as the responses consumer —
+        # it is what back-fills prompts for correlations the bridge did not originate,
+        # so a topic it is not subscribed to is a correlation with no prompt. The
+        # per-user subscription management is T6; this threads the set through.
+        self._topics = topics or tenancy.TopicSet(
+            "", request_topic=request_topic, response_topic="")
+        self._topic = self._topics.requests() if not self._topics.multi else request_topic
         self._store = store
         # Per-process group id so every EB start re-scans the whole topic.
         # `backfill_prompt_if_missing()` makes re-inserts a no-op, so this

@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 
 from eventbridge import auth, ghauth
+from shared import tenancy
 
 
 @dataclass
@@ -77,7 +78,37 @@ class Cfg:
     # Enforcement rewrites persisted rows and raises a priority-5 notification, so
     # there has to be a way to watch the reject rate before turning it on.
     require_response_signature: bool = False
+
+    # ---- Phase 3 (DESIGN_PHASE3.md §8.1) ----
+
+    # §3.2 / §8.1 — `single` is Phase 2 behaviour: one topic pair, one store, no
+    # ownership checks. `multi` is everything in §3-§7. Default `single` so an existing
+    # deployment that upgrades and changes nothing behaves exactly as it did.
+    tenancy_mode: str = tenancy.SINGLE
+    # §3.1 — first component of every per-user topic name. Unused in `single` mode,
+    # where the configured request/response topics are returned verbatim.
+    topic_prefix: str = "kev1"
+    # §2.5 — the user registry ConfigMap. Empty in `multi` mode denies everyone, for
+    # the same reason Phase 2's empty allowed_users does: the other reading turns a
+    # missing file into an open door.
+    user_registry_path: str = ""
+
     ntfy: NtfyCfg = field(default_factory=NtfyCfg)
+
+    @property
+    def topics(self) -> tenancy.TopicSet:
+        """§3.2's helper, built from this config.
+
+        A property rather than a field so it cannot drift from `request_topic` /
+        `response_topic` after `load()` — the topic names and the set that derives from
+        them are one fact, and storing it twice is how they disagree.
+        """
+        return tenancy.TopicSet(
+            self.topic_prefix,
+            tenancy=self.tenancy_mode,
+            request_topic=self.request_topic,
+            response_topic=self.response_topic,
+        )
 
 
 def _root_tmpdir() -> str:
@@ -148,6 +179,17 @@ def load() -> Cfg:
     cfg.require_response_signature = (
         e("EB_REQUIRE_RESPONSE_SIGNATURE",
           "true" if cfg.require_response_signature else "false").lower() == "true")
+
+    # §8.1. Env only for the mode and the registry path: tenancy is a deployment-shape
+    # decision, and a committed config.toml that could flip it on is a way to get
+    # per-user isolation half-enabled by accident.
+    cfg.tenancy_mode = (e("EB_TENANCY_MODE", cfg.tenancy_mode) or "").strip().lower()
+    if cfg.tenancy_mode not in (tenancy.SINGLE, tenancy.MULTI):
+        raise SystemExit(
+            f"EB_TENANCY_MODE must be {tenancy.SINGLE!r} or {tenancy.MULTI!r}, "
+            f"got {cfg.tenancy_mode!r}. See DESIGN_PHASE3.md §8.1.")
+    cfg.topic_prefix = e("EB_TOPIC_PREFIX", cfg.topic_prefix)
+    cfg.user_registry_path = e("EB_USER_REGISTRY_PATH", cfg.user_registry_path)
 
     cfg.ntfy.enabled  = (e("NTFY_ENABLED", "true" if cfg.ntfy.enabled else "false").lower() == "true")
     cfg.ntfy.base_url = e("NTFY_BASE_URL", cfg.ntfy.base_url)
