@@ -193,14 +193,17 @@ as it did:
 | `EB_TENANCY_MODE` | `single` | `single` reproduces Phase 2: one topic pair, one store, no ownership checks. `multi` switches on per-user topics and requires an authenticated, registered caller |
 | `EB_TOPIC_PREFIX` | `kev1` | First component of every per-user topic name, `{prefix}-{userkey}-requests`. Unused in `single` mode |
 | `EB_USER_REGISTRY_PATH` | — | The approved-user registry (a ConfigMap, §2.5). **Required in `multi` mode, and an empty one denies everyone** — the other reading turns a missing file into an open door |
+| `EB_MAX_OPEN_STORES` | `64` | LRU ceiling on open per-user SQLite stores. Two WAL connections per tenant (main + `-wal` + `-shm`), so a 1024 soft descriptor limit bounds this near 150–200 tenants |
 | `ER_USERKEY` | — | Which tenant this runner serves. Stamped on every response so EventBridge can file it. **Required once `REQUEST_TOPIC` is not `requests`**; the runner refuses to start otherwise |
 | `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2) |
 | `ER_AGENT_NAME` | `default` | Fallback agent when neither the request nor the registry names one. `default` with no file on disk is Phase 2's argv exactly |
 
-Two notes on these. **`multi` mode is not yet isolation you should present as such** —
-per-user *stores*, owner-scoped reads and transcript authentication are steps 5–8 and
-are not implemented, so in `multi` mode the HTTP reads and `/continue` are still as open
-as Phase 2's. And even once they land, separate topics without Kafka ACLs are
+Two notes on these. **`multi` mode is not yet isolation you should present as such.**
+Per-user stores *are* implemented (T5), so each tenant's sessions, responses and
+transcripts live in their own SQLite files and a read routes to the owning tenant's store
+— but nothing yet checks that the *caller* is that owner, because owner-scoped reads (T7)
+and transcript authentication (T8) are not in. So in `multi` mode the HTTP reads,
+`/continue` and `PUT /transcript` are still as open as Phase 2's. And even once they land, separate topics without Kafka ACLs are
 *organisation*, not isolation; `DESIGN_PHASE3.md` §3.6 and §10 are explicit about which
 claim each configuration earns. **Adding a user is an operator action**: EventBridge has
 no Kubernetes client and will not create topics, so a registry entry whose topics do not
