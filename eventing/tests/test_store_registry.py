@@ -183,6 +183,38 @@ def test_a_usable_store_is_returned_even_under_relentless_eviction(tmp_path):
         assert s.get_session(f"brave-otter-000{i}") is not None
 
 
+def test_an_evicted_store_stays_usable_while_someone_holds_it(tmp_path):
+    """Regression, and the reason eviction drops a reference rather than closing.
+
+    A handler resolves a store and keeps making calls on it; meanwhile a concurrent
+    request for a different tenant pushes the cache over its ceiling. If eviction closed
+    the store, the holder's next call would fail with `ProgrammingError: Cannot operate
+    on a closed database` from a line that looks unrelated to caching — and EVERY
+    multi-call read path was exposed (`get_html` alone makes five calls).
+    """
+    r = _multi(tmp_path, max_open=1)
+    held = r.for_userkey(A)
+    held.upsert_session("brave-otter-0001", "u1", "/w", "hello")
+    r.for_userkey(B)                       # evicts A from the cache
+    # The holder must still be able to use it, both for reads and for subscribing.
+    assert held.get_session("brave-otter-0001") is not None
+    ev = held.subscribe("brave-otter-0001")
+    assert held.events_for("brave-otter-0001") == []
+    held.unsubscribe("brave-otter-0001", ev)
+
+
+def test_the_sse_path_pins_its_store_before_reading(tmp_path):
+    """`_sse_generator` subscribes before the replay, so the store cannot be evicted
+    between resolving it and pinning it."""
+    import inspect
+
+    from eventbridge.handlers import Handlers
+    src = inspect.getsource(Handlers._sse_generator)
+    sub = src.index(".subscribe(")
+    replay = src.index("events_for(correlationid, since_seq=since_seq)")
+    assert sub < replay, "subscribe must come before the replay read"
+
+
 def test_max_open_is_floored_at_one(tmp_path):
     """A zero or negative ceiling would evict every store immediately after opening
     it, which is an infinite reopen loop rather than a small cache."""
