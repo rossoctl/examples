@@ -25,7 +25,7 @@ from typing import Callable
 from kafka import KafkaConsumer
 
 from eventbridge.store import Store
-from shared import ce, signing
+from shared import ce, signing, tenancy
 
 
 class Consumer(threading.Thread):
@@ -41,11 +41,27 @@ class Consumer(threading.Thread):
         keyset=None,
         require_signature: bool = False,
         bridge_kid: str | None = None,
+        topics: tenancy.TopicSet | None = None,
+        stores=None,
     ) -> None:
         super().__init__(daemon=True, name="kafka-responses-consumer")
         self._bootstrap_servers = bootstrap
-        self._topic = response_topic
+        # §3.2: the chosen option is an EXPLICIT topic list, re-subscribed when the
+        # registry changes — not `subscribe(pattern=...)`. A pattern is picked up by
+        # metadata refresh (`metadata.max.age.ms`, 5 minutes by default), so a new
+        # user's first response can be published before anyone is subscribed, and with
+        # `auto_offset_reset=latest` it is simply never read: the page stays empty, the
+        # group counter never advances, and no error appears anywhere.
+        #
+        # In single mode the list is the one configured topic, which is today's
+        # behaviour. The blocking `ensure_subscribed` that makes multi mode safe is T6.
+        self._topics = topics or tenancy.TopicSet(
+            "", response_topic=response_topic, request_topic="")
+        self._topic = self._topics.responses() if not self._topics.multi else response_topic
         self._store = store
+        # §6.1 — when set, each response is filed in the store its own `ce_userkey`
+        # names. `None` keeps the single-store behaviour, which is single-tenant mode.
+        self._stores = stores
         self._on_event = on_event
         self._on_group_event = on_group_event
         self._on_member_event = on_member_event
@@ -138,7 +154,15 @@ class Consumer(threading.Thread):
                             try: self._on_group_event(d)
                             except Exception as e: print(f"[kafka_in] group event: {e!r}")
                     else:
-                        self._store.insert_response(d)
+                        # §6.1: routed by the event's OWN userkey, which is signed
+                        # (§2.6) so it cannot be rewritten in flight. An event with no
+                        # userkey in multi-tenant mode lands in `shared/` and bumps the
+                        # `unattributed` counter — never guessed into a tenant's store
+                        # (that corrupts somebody's history) and never dropped (that is
+                        # indistinguishable from an agent that never answered).
+                        target = (self._stores.for_event(evt) if self._stores
+                                  else self._store)
+                        target.insert_response(d)
                         if self._on_member_event and d.get("groupid"):
                             try: self._on_member_event(d)
                             except Exception as e: print(f"[kafka_in] member event: {e!r}")

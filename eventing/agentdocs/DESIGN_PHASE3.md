@@ -1,6 +1,23 @@
 # DESIGN — Phase 3: per-user isolation, declarative agents, and event triggers
 
-Status: draft (revision 1) — **design only, nothing in this document is implemented yet.**
+Status: draft (revision 1) — **partly implemented.** §9's steps 1-4 are in the tree:
+T1 (`shared/tenancy.py`), T2 (`TopicSet` threaded through both services), T3 (`Caller`,
+the registry, `ce_userkey`), T4 (`SIGNED_ATTRS` += `userkey`, `depth`), T13 (`AgentSpec`)
+and T22 (the Secret-vs-ConfigMap test). **T5 is also in** — per-user stores
+(`store_registry.py`), the global `correlationid → userkey` index (`owner_index.py`), and
+the `Minter` uniqueness check that replaces the startup seeding loop (§2.6).
+`EB_TENANCY_MODE` defaults to `single`, which reproduces Phase 2 byte for byte, so nothing
+below is switched on anywhere yet.
+
+Still design only: **T6** (`ensure_subscribed`), **T7** (owner-scoped reads — the per-user
+stores exist and reads route to the owning tenant's store, but nothing yet checks that the
+*caller* is the owner, so `multi` mode's reads are still as open as Phase 2's), **T8**
+(transcript auth), **T9-T12** (capability keys, ntfy isolation, `k8s_tenant.py`),
+**T14-T19** (triggers and fetched skills), **T20** (Kafka ACLs), **T21** (retention and
+deletion).
+
+Where a section is implemented, the code is the authority on what it does; this document
+remains the authority on *why*.
 Scope: **delta over `DESIGN_PHASE2.md`.** Read that first, and §2.1 of it before
 anything else here.
 

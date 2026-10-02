@@ -29,12 +29,20 @@ class Emitter:
     """
 
     def __init__(self, bootstrap: str, response_topic: str, source_uri: str,
-                 seed: bytes | None = None, kid: str | None = None) -> None:
+                 seed: bytes | None = None, kid: str | None = None,
+                 userkey: str | None = None) -> None:
         self._prod = KafkaProducer(bootstrap_servers=bootstrap, acks="all", linger_ms=5)
         self._topic = response_topic
         self._source = source_uri
         self._seed = seed
         self._kid = kid
+        # Phase 3 §3.3: stamped on every response so EventBridge knows which store to
+        # file it in. Held here rather than threaded through `emit`'s callers because
+        # it is a property of the *runner* — this pod serves exactly one tenant — and a
+        # per-call parameter would be one more thing a call site could forget, with a
+        # misfiled response as the symptom. Empty in single-tenant mode, where the
+        # attribute is simply absent and behaviour is Phase 2's.
+        self._userkey = userkey or None
         self._seq_lock = threading.Lock()
         self._seq_by_corr: dict[str, int] = {}
 
@@ -65,6 +73,8 @@ class Emitter:
             attrs["causationid"] = causationid
         if groupid:
             attrs["groupid"] = groupid
+        if self._userkey:
+            attrs[ce.EXT_USERKEY] = self._userkey
         event = ce.new_event(
             type=ce.TYPE_RESPONSE,
             source=self._source,

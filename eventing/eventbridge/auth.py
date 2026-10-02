@@ -37,11 +37,72 @@ it believes submitted, and — when signing is on — makes that record tamper-e
 from __future__ import annotations
 
 import hmac
+from dataclasses import dataclass
 from typing import Any
+
+from shared import tenancy
 
 # Returned verbatim as the `WWW-Authenticate` value on a 401 so a client knows
 # which scheme to retry with.
 CHALLENGE = 'Bearer realm="eventbridge"'
+
+# The issuer string recorded for a static `EB_AUTH_TOKENS` identity. `ce_submitteriss`
+# stays ABSENT for these (Phase 2 §2.6: absent issuer = an operator typed this name), but
+# the tenancy key still needs an issuer in its hashed input — otherwise a static `alice`
+# and a GitHub `alice` would be one tenant, which is the §2.3 impersonation failure.
+ISSUER_STATIC = "static"
+
+
+@dataclass(frozen=True)
+class Caller:
+    """Who is asking, and the tenancy key that follows from it. §2.4.
+
+    `userkey` is carried here so no caller derives it twice: it is needed to pick a
+    topic, a store and an ntfy topic, and three independent derivations are three
+    chances to disagree.
+
+    `None` for all of `userid`/`issuer`/`userkey` is the anonymous case, which is what
+    Phase 2's "no auth configured" default produces and is what keeps the demo working
+    out of the box. §2.4 is explicit that this is incompatible with per-user isolation —
+    there is no user to isolate — so `multi` mode refuses it with `401`. The two modes
+    disagree about this on purpose.
+    """
+    userid: str | None = None
+    issuer: str | None = None
+    userkey: str | None = None
+    tier: str = "shared"
+
+    @property
+    def anonymous(self) -> bool:
+        return self.userid is None
+
+    @property
+    def submitter_iss(self) -> str | None:
+        """What rides on the event as `ce_submitteriss`.
+
+        Deliberately NOT the same as `issuer`: a static identity has an issuer here (so
+        its tenancy key separates from a GitHub login of the same name) but must stay
+        absent on the wire, because Phase 2 made absence mean "an operator typed this".
+        Collapsing the two would quietly upgrade an operator's assertion into a verified
+        claim.
+        """
+        return None if self.issuer in (None, ISSUER_STATIC) else self.issuer
+
+
+def caller_for(userid: str | None, issuer: str | None, *,
+               tenancy_mode: str = tenancy.SINGLE, tier: str = "shared") -> Caller:
+    """Build a `Caller`, deriving the tenancy key exactly once.
+
+    The key is derived only in `multi` mode. In `single` mode it stays `None`, which is
+    what keeps `ce_userkey` off the wire entirely for a Phase 2 deployment — the
+    attribute is additive, and an event that does not need it does not carry it.
+    """
+    if userid is None:
+        return Caller()
+    key = None
+    if tenancy_mode == tenancy.MULTI:
+        key = tenancy.userkey(issuer or ISSUER_STATIC, userid)
+    return Caller(userid=userid, issuer=issuer, userkey=key, tier=tier)
 
 
 def parse_tokens(raw: str) -> dict[str, str]:
@@ -205,3 +266,50 @@ def resolve(environ: dict[str, Any], cfg, *, cache=None,
     if why:
         return None, None, 401, why
     return name, None, None, None
+
+
+def resolve_caller(environ: dict[str, Any], cfg, *, cache=None, fetch=None,
+                   registry=None) -> tuple[Caller | None, int | None, str | None]:
+    """`resolve`, plus the tenancy key and the registry check. `(caller, status, reason)`.
+
+    This is the Phase 3 entry point; `resolve` keeps its 4-tuple shape so Phase 2's
+    callers and tests are untouched.
+
+    Two refusals exist only in `multi` mode, and both are deliberate disagreements with
+    the single-tenant defaults rather than oversights:
+
+    * **Anonymous is `401`.** Phase 2's "no auth configured means allowed and anonymous"
+      is what makes the demo work out of the box, and it cannot coexist with per-user
+      isolation: there is no user to isolate, so there is no store to write to and no
+      topic to publish on.
+    * **Not in the registry is `403`.** The registry is the approved list in `multi`
+      mode, and an empty one approves nobody — Phase 2 §2.4's reading, for Phase 2's
+      reason. `403` rather than `404` follows Phase 2 §2.4 too: this is the "I know
+      exactly who you are and you are not approved" case, and naming the refused
+      identity is what makes it actionable for someone who already knows who they are.
+      (§6.2's `404`-not-`403` rule is a different question — hiding whether another
+      tenant's correlation exists — and does not apply here.)
+    """
+    userid, issuer, status, reason = resolve(environ, cfg, cache=cache, fetch=fetch)
+    if status:
+        return None, status, reason
+
+    mode = getattr(cfg, "tenancy_mode", tenancy.SINGLE)
+    if mode != tenancy.MULTI:
+        return caller_for(userid, issuer, tenancy_mode=mode), None, None
+
+    if userid is None:
+        return None, 401, ("this deployment is multi-tenant; an authenticated identity "
+                           "is required (EB_TENANCY_MODE=multi)")
+
+    user = registry.lookup(issuer, userid) if registry is not None else None
+    if user is None:
+        return None, 403, f"{userid} is not in the user registry"
+
+    caller = caller_for(userid, issuer, tenancy_mode=mode, tier=user.tier)
+    # The registry's recorded key is authoritative when present: `parse` has already
+    # refused any file whose recorded key disagrees with this build's derivation, so
+    # these are equal — using the registry's value documents which one wins if that
+    # check is ever relaxed.
+    return Caller(userid=caller.userid, issuer=caller.issuer,
+                  userkey=user.userkey, tier=user.tier), None, None

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from kafka import KafkaProducer
 
-from shared import ce, signing
+from shared import ce, signing, tenancy
 
 
 class Producer:
@@ -31,7 +31,8 @@ class Producer:
 
     def __init__(self, bootstrap: str, request_topic: str, source_uri: str,
                  response_topic: str | None = None,
-                 seed: bytes | None = None, kid: str | None = None) -> None:
+                 seed: bytes | None = None, kid: str | None = None,
+                 topics: tenancy.TopicSet | None = None) -> None:
         self._prod = KafkaProducer(bootstrap_servers=bootstrap, acks="all", linger_ms=5)
         self._topic = request_topic
         self._response_topic = response_topic
@@ -39,6 +40,12 @@ class Producer:
         # Held on the instance so no call site has to know about signing.
         self._seed = seed
         self._kid = kid
+        # §3.2: one producer can send to any topic — the topic is an argument to
+        # `send()`, not to the constructor — so per-user topics need no second producer
+        # and no connection per user. `None` builds a single-mode set from the two
+        # explicit topics above, which is exactly today's behaviour.
+        self._topics = topics or tenancy.TopicSet(
+            "", request_topic=request_topic, response_topic=response_topic or "")
 
     def publish_request(
         self,
@@ -53,7 +60,16 @@ class Producer:
         groupid: str | None = None,
         submitter: str | None = None,
         submitter_iss: str | None = None,
+        userkey: str | None = None,
+        agent: str | None = None,
     ) -> str:
+        """Publish one request. `userkey` selects the topic in multi-tenant mode.
+
+        §2.6: `userkey` also rides on the event, because EventRunner stamps it back onto
+        the response and that is what tells EventBridge which store to file the response
+        in. It is in `signing.SIGNED_ATTRS` (T4) so it cannot be rewritten in flight.
+        """
+        topic = self._topics.requests(userkey)
         event = ce.new_event(
             type=ce.TYPE_REQUEST,
             source=self._source,
@@ -66,17 +82,20 @@ class Producer:
             **({"groupid": groupid} if groupid else {}),
             **({ce.EXT_SUBMITTER: submitter} if submitter else {}),
             **({ce.EXT_SUBMITTER_ISS: submitter_iss} if submitter_iss else {}),
+            **({ce.EXT_USERKEY: userkey} if userkey else {}),
+            **({ce.EXT_AGENT: agent} if agent else {}),
         )
         # After new_event (which fills `id` and `time`, both signed) and before
         # serialisation, so the signature covers exactly what goes on the wire.
         signing.sign_into(event, self._seed, self._kid)
         headers, value = ce.to_kafka_binary(event)
-        future = self._prod.send(self._topic, key=correlationid.encode(), value=value, headers=headers)
+        future = self._prod.send(topic, key=correlationid.encode(), value=value, headers=headers)
         future.get(timeout=5)
         return event["id"]
 
     def publish_group_event(self, *, type_: str, groupid: str,
-                            data: dict, subject: str = "group") -> str:
+                            data: dict, subject: str = "group",
+                            userkey: str | None = None) -> str:
         """Publish a group lifecycle event to the RESPONSES topic (§21.2).
 
         Not requests: EventRunner consumes that topic and would treat a group event as
@@ -89,8 +108,9 @@ class Producer:
         worth closing: a forged `group.completed` ends a batch early and fires a
         "finished" notification for work that never ran.
         """
-        if not self._response_topic:
+        if not self._topics.multi and not self._response_topic:
             raise RuntimeError("Producer has no response_topic; cannot publish group events")
+        topic = self._topics.responses(userkey)
         event = ce.new_event(
             type=type_,
             source=self._source,
@@ -98,10 +118,11 @@ class Producer:
             datacontenttype="application/json",
             groupid=groupid,
             data=data,
+            **({ce.EXT_USERKEY: userkey} if userkey else {}),
         )
         signing.sign_into(event, self._seed, self._kid)
         headers, value = ce.to_kafka_binary(event)
-        self._prod.send(self._response_topic, key=groupid.encode(),
+        self._prod.send(topic, key=groupid.encode(),
                         value=value, headers=headers).get(timeout=5)
         return event["id"]
 
