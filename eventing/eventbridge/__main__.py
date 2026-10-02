@@ -20,8 +20,9 @@ from eventbridge.kafka_requests_mirror import RequestsMirror
 from eventbridge.netcands import enumerate_candidates, format_startup_hint
 from eventbridge.ntfy import NtfyPublisher
 from eventbridge.openapi import spec
+from eventbridge.owner_index import OwnerIndex
 from eventbridge.router import Dispatcher
-from eventbridge.store import Store
+from eventbridge.store_registry import StoreRegistry
 from shared import keyset, signing
 from shared.pidfile import PidFile
 
@@ -43,10 +44,12 @@ def main() -> int:
     oas_path.parent.mkdir(parents=True, exist_ok=True)
     oas_path.write_text(json.dumps(spec(), indent=2))
 
-    store = Store(pathlib.Path(cfg.tmpdir) / "eventbridge")
-    minter = Minter()
-    for corr in store.all_correlations(limit=10000):
-        minter.remember(corr)
+    eb_root = pathlib.Path(cfg.tmpdir) / "eventbridge"
+    # §2.6 — the global `correlationid -> userkey` index. Always built, including in
+    # single-tenant mode: the uniqueness guarantee it provides is worth having for every
+    # deployment, and it is what replaces the startup seeding loop below.
+    owners = OwnerIndex(eb_root)
+    minter = Minter(index=owners)
 
     # §11 — key material is loaded ONCE, here, and deliberately not caught. A bridge
     # that believes it is signing but is not fails silently; one that will not start
@@ -115,13 +118,27 @@ def main() -> int:
         print(f"[eventbridge] registry has {len(users)} user(s) but "
               f"EB_TENANCY_MODE=single, so it is not consulted")
 
+    # §6.1 — per-user stores. Built after `topics` because the layout depends on the
+    # mode: single-tenant keeps `responses.sqlite`/`sessions.sqlite` directly in the
+    # bridge root, so a Phase 2 deployment's existing sessions and transcripts stay
+    # exactly where they are and keep showing up in the UI.
+    stores = StoreRegistry(eb_root, max_open=cfg.max_open_stores,
+                           multi=topics.multi)
+    # The `shared` store: single-tenant mode's only store, and multi-tenant mode's home
+    # for anything that arrives without a `userkey` (§6.1's `unattributed` path).
+    store = stores.for_userkey(None)
+    if topics.multi:
+        print(f"[eventbridge] per-user stores under {eb_root}/users "
+              f"(max_open={cfg.max_open_stores}), "
+              f"{owners.count()} correlation(s) in the ownership index")
+
     # The producer needs the RESPONSES topic too: group lifecycle events go there,
     # not on requests, because EventRunner would try to execute anything on requests.
     producer = Producer(cfg.kafka_bootstrap, cfg.request_topic, cfg.source_uri,
                         response_topic=cfg.response_topic,
                         seed=seed, kid=cfg.signing_kid or None,
                         topics=topics)
-    groups = GroupService(cfg, store, producer, minter)
+    groups = GroupService(cfg, store, producer, minter, stores=stores)
 
     ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store)
     if cfg.ntfy.enabled and cfg.ntfy.topic:
@@ -134,7 +151,8 @@ def main() -> int:
                         keyset=ks,
                         require_signature=cfg.require_response_signature,
                         bridge_kid=cfg.signing_kid or None,
-                        topics=topics)
+                        topics=topics,
+                        stores=stores if topics.multi else None)
     consumer.start()
 
     # Back-fill prompts from the requests topic — also gives us prompt visibility
@@ -152,7 +170,9 @@ def main() -> int:
     group_mirror.start()
 
     h = Handlers(cfg, store, producer, minter, groups=groups,
-                 registry=users if topics.multi else None)
+                 registry=users if topics.multi else None,
+                 stores=stores if topics.multi else None,
+                 owners=owners if topics.multi else None)
     dsp = Dispatcher()
     dsp.add("POST", r"/v0/agents",                                          h.start_agent)
     dsp.add("POST", r"/v0/agents/(?P<correlationid>[a-z0-9-]+)/continue",   h.continue_agent)
