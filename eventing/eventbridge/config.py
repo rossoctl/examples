@@ -92,6 +92,11 @@ class Cfg:
     # the same reason Phase 2's empty allowed_users does: the other reading turns a
     # missing file into an open door.
     user_registry_path: str = ""
+    # §6.1 — LRU ceiling on open per-user SQLite stores. Two connections per tenant,
+    # each in WAL mode (main + `-wal` + `-shm`), so the default 1024 soft RLIMIT_NOFILE
+    # bounds this near 150-200 tenants; 64 leaves room for the Kafka sockets, the HTTP
+    # listener and the worker pool.
+    max_open_stores: int = 64
 
     ntfy: NtfyCfg = field(default_factory=NtfyCfg)
 
@@ -190,6 +195,7 @@ def load() -> Cfg:
             f"got {cfg.tenancy_mode!r}. See DESIGN_PHASE3.md §8.1.")
     cfg.topic_prefix = e("EB_TOPIC_PREFIX", cfg.topic_prefix)
     cfg.user_registry_path = e("EB_USER_REGISTRY_PATH", cfg.user_registry_path)
+    cfg.max_open_stores = int(e("EB_MAX_OPEN_STORES", str(cfg.max_open_stores)))
 
     cfg.ntfy.enabled  = (e("NTFY_ENABLED", "true" if cfg.ntfy.enabled else "false").lower() == "true")
     cfg.ntfy.base_url = e("NTFY_BASE_URL", cfg.ntfy.base_url)
