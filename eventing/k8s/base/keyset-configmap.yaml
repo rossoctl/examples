@@ -1,0 +1,28 @@
+# §11 — the approved-agent key set. THIS FILE IS THE AUTHORIZATION LIST: an event
+# whose `kid` is not in it is refused, and so is one carrying no signature at all.
+# Approving an agent means adding its public key; revoking it means removing the entry.
+#
+# Committed EMPTY, and a test asserts it stays that way. Two reasons:
+#
+#   * A non-empty committed keyset would mean someone pasted a key into the repository.
+#     Public keys are not secrets, but a 32-byte seed is indistinguishable from a public
+#     key by length (shared/keyset.py), so "there is never a key in this file" is a rule
+#     that can be checked, where "only public keys in this file" is not.
+#   * `{}` is a valid keyset that approves nobody, and `keyset.load_if_set` treats an
+#     empty PATH as "not enabled" — so an operator who mounts this without populating it
+#     gets a clean "no approved kids" at startup rather than a confusing partial state.
+#
+# Populated at deploy time by `k8s_deploy.py --signing-keys DIR`, which replaces the
+# whole ConfigMap from the `agents.json` that `gen_signing_keys.py` derived from the
+# seeds. Unlike the seeds this may safely appear in `kubectl kustomize` output.
+#
+# Rotation is a restart, not a reload: `shared/keyset.py` deliberately has no live
+# reload, because a verifier that silently widens the set it trusts is harder to reason
+# about than one that restarts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eventing-keyset
+data:
+  agents.json: |
+    {}

@@ -5,6 +5,7 @@ kind: Kustomization
 # it targets ns kafka and cannot participate in an overlay's namespace rewrite.
 resources:
   - configmap.yaml
+  - keyset-configmap.yaml
   - eventbridge-deployment.yaml
   - eventbridge-service.yaml
   - eventbridge-route.yaml

@@ -48,6 +48,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # §11. Appended, not inserted: the demo overlay JSON-patches
+            # `/spec/template/spec/volumes/0` to swap `data` for a PVC, so anything
+            # placed before `data` would be replaced instead of it.
+            - name: signing-key
+              mountPath: /etc/ce-signing
+              readOnly: true
+            - name: keyset
+              mountPath: /etc/ce-keyset
+              readOnly: true
           # §8.4 — the failure this catches is a LIVE process with a DEAD thread.
           # If the Kafka consumer thread raises, the main thread keeps running, so
           # the pod stays Running and reports healthy while consuming nothing. A
@@ -73,3 +82,28 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        # §11 — the Ed25519 seed this runner signs terminal responses with. The
+        # Secret is NOT declared in any manifest: `k8s_deploy.py --signing-keys`
+        # applies it via stdin, because a kustomize secretGenerator would inline the
+        # seed into `kubectl kustomize` output (which the §14.1 digest hashes and
+        # people paste into terminals) and `--from-literal` would put it in argv.
+        #
+        # `optional: true` is what keeps every signing-less overlay working: without
+        # it the pod blocks in ContainerCreating until a Secret that will never exist
+        # appears. No `defaultMode` on purpose — 0400 would be root-only, and there is
+        # no `runAsUser`/`fsGroup` here (OpenShift assigns the UID), so the default
+        # 0644 is what makes the file readable by whatever UID the SCC picks.
+        # A Secret PER SERVICE: see the matching note in eventbridge-deployment.yaml.
+        # If both mounted one seed, EventBridge would hold the key it verifies this
+        # runner's responses with and could forge them — the HMAC property §4.3 rejected.
+        - name: signing-key
+          secret:
+            secretName: eventrunner-signing-key
+            optional: true
+        # The approved-key set this runner verifies incoming requests against. A
+        # ConfigMap, never a Secret — see shared/keyset.py on why the location is
+        # what keeps a pasted private key visible in review.
+        - name: keyset
+          configMap:
+            name: eventing-keyset
+            optional: true
