@@ -137,6 +137,33 @@ def test_a_subscribed_store_is_never_evicted(tmp_path):
     assert r.evictions >= 1               # something else was evicted instead
 
 
+def test_a_writer_reaches_a_live_viewer_across_an_eviction_wave(tmp_path):
+    """The notification path pinning actually protects, not just object identity.
+
+    Without the pinning check the earlier tests still passed: eviction no longer closes a
+    store, so a held reference keeps working. What breaks is subtler — the *writer* calls
+    `for_userkey` and gets a NEW Store object, whose `_subscribers` map is empty, so
+    `insert_response` notifies nobody and the viewer's page stops updating with no error
+    anywhere. That is the Phase 2 §6.1 symptom class, and this is the assertion for it.
+    """
+    r = _multi(tmp_path, max_open=1)
+    viewer_store = r.for_userkey(A)
+    ev = viewer_store.subscribe("brave-otter-0001")
+
+    # A burst of other tenants, each of which would evict A if it were not pinned.
+    for i in range(5):
+        r.for_userkey(f"gh-u{i}-0000000{i}")
+
+    # The writer resolves the store the way the responses consumer does.
+    writer_store = r.for_userkey(A)
+    assert writer_store is viewer_store, "writer and viewer must share one Store"
+    writer_store.insert_response({
+        "correlationid": "brave-otter-0001", "sequence": 1, "phase": "result",
+        "final": "true", "id": "e1", "time": "2026-10-02T00:00:00Z", "data": {"text": "hi"},
+    })
+    assert ev.is_set(), "the viewer was never notified"
+
+
 def test_the_cache_may_exceed_max_open_when_everything_is_pinned(tmp_path):
     """Going over a soft descriptor budget degrades; breaking a live viewer does not
     recover. The first is the right direction to err."""
