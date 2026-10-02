@@ -67,6 +67,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # §11. Appended, not inserted: the demo overlay JSON-patches
+            # `/spec/template/spec/volumes/0` to swap `data` for a PVC, so anything
+            # placed before `data` would be replaced instead of it.
+            - name: signing-key
+              mountPath: /etc/ce-signing
+              readOnly: true
+            - name: keyset
+              mountPath: /etc/ce-keyset
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -91,3 +100,29 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        # §11 — the seed EventBridge signs requests and group lifecycle events with.
+        # NOT declared in any manifest: `k8s_deploy.py --signing-keys` applies the
+        # Secret via stdin, because a kustomize secretGenerator would inline the seed
+        # into `kubectl kustomize` output and `--from-literal` would leak it to argv.
+        #
+        # `optional: true` keeps signing-less overlays working — without it the pod
+        # blocks in ContainerCreating waiting for a Secret that will never exist. No
+        # `defaultMode`: 0400 would be root-only, and with no `runAsUser`/`fsGroup`
+        # (OpenShift assigns the UID) the default 0644 is what makes it readable.
+        # A Secret PER SERVICE, not one shared between them. A single seed would mean
+        # EventBridge holds the key it verifies runner responses with, so it could
+        # forge any agent's answer and an agent could forge another's — which is the
+        # exact property that made HMAC unacceptable (DESIGN_PHASE2.md §4.3). Two
+        # Secrets is what keeps "only this agent could have produced this" true.
+        - name: signing-key
+          secret:
+            secretName: eventbridge-signing-key
+            optional: true
+        # The approved-key set — `kid` -> public key. A ConfigMap, never a Secret: a
+        # 32-byte seed is indistinguishable from a public key by length, so keeping
+        # the set somewhere a Secret is not is what makes a pasted private key
+        # obvious in review (shared/keyset.py).
+        - name: keyset
+          configMap:
+            name: eventing-keyset
+            optional: true
