@@ -130,10 +130,25 @@ class Handlers:
         return auth.resolve_caller(environ, self.cfg, cache=self.logins,
                                    registry=self.registry)
 
-    def _owner_userkey(self, correlationid: str) -> str | None:
+    def _owner_userkey(self, correlationid: str) -> tuple[str | None, str | None]:
         """Which tenant owns this correlation, for a `/continue` turn.
 
-        `None` in single-tenant mode, where topics do not depend on it.
+        Returns `(userkey, unresolved_reason)`. Exactly one is ever set:
+
+        * `(None, None)`   — single-tenant mode; topics do not depend on a key.
+        * `(key, None)`    — the owning tenant.
+        * `(None, reason)` — multi mode and the owner cannot be determined.
+
+        The two-value return exists because the two `None` cases need opposite
+        handling and a bare `None` cannot tell them apart. Passing an unresolved
+        `None` into `TopicSet.requests()` raises `ValueError` — correctly, since
+        publishing to a shared topic would run this turn on another tenant's runner —
+        but that surfaces as a WSGI 500 with a stack trace instead of a status code.
+        A correlation with no resolvable owner is reachable in normal operation: a
+        user removed from the registry, a `prompts` row whose `submitter` is NULL
+        (the column is nullable and pre-dates auth), or a correlation back-filled
+        from the topic by `RequestsMirror`. So the caller refuses with a `503` naming
+        the problem, matching how §2.5 treats a user whose topics do not exist.
 
         `/continue` is still unauthenticated here — Phase 2 §3.1's capability-URL
         design — so this resolves the owner from what was *recorded at submit time*
@@ -150,20 +165,24 @@ class Handlers:
         for the uniqueness guarantee that keeps `sessionuuid` unsalted.
         """
         if not self.cfg.topics.multi:
-            return None
+            return None, None
         prompts = self.store.get_prompts(correlationid) or []
-        for p in prompts:
-            if submitter := p.get("submitter"):
-                # The issuer is not recorded alongside the submitter today, so this
-                # cannot distinguish a GitHub `alice` from a static `alice`. In `multi`
-                # mode anonymous and static submissions are already refused at the
-                # submit path (§2.4), so GitHub is the only issuer that reaches here —
-                # stated rather than assumed, because the day an OIDC issuer is wired
-                # up (§2.4's slot) this becomes wrong and has to move to the index.
-                if user := (self.registry.lookup("github", submitter)
-                            if self.registry else None):
-                    return user.userkey
-        return None
+        submitters = [s for p in prompts if (s := p.get("submitter"))]
+        if not submitters:
+            return None, ("no submitter recorded for this correlation, so the owning "
+                          "tenant cannot be determined")
+        for submitter in submitters:
+            # The issuer is not recorded alongside the submitter today, so this
+            # cannot distinguish a GitHub `alice` from a static `alice`. In `multi`
+            # mode anonymous and static submissions are already refused at the
+            # submit path (§2.4), so GitHub is the only issuer that reaches here —
+            # stated rather than assumed, because the day an OIDC issuer is wired
+            # up (§2.4's slot) this becomes wrong and has to move to the index.
+            if user := (self.registry.lookup("github", submitter)
+                        if self.registry else None):
+                return user.userkey, None
+        return None, (f"{submitters[0]} is no longer in the user registry, so the "
+                      f"owning tenant cannot be determined")
 
     # ---- start ----
     def start_agent(self, environ, start_response, **_):
@@ -369,12 +388,18 @@ class Handlers:
         if session is None:
             return _json(start_response, "404 Not Found", {"error": "unknown correlationid"})
         sess = session["sessionuuid"]
+        owner, unresolved = self._owner_userkey(correlationid)
+        if unresolved:
+            # Checked before anything is written, so a refused turn leaves no touched
+            # session row and no orphan prompt row claiming a turn that never ran.
+            return _json(start_response, "503 Service Unavailable",
+                         {"error": f"cannot resume: {unresolved}"})
         self.store.upsert_session(correlationid, sess, session["workdir"], None)
         turn_index = self.store.insert_prompt(correlationid, "continue", prompt)
         event_id = self.producer.publish_request(
             prompt=prompt, correlationid=correlationid, sessionuuid=sess,
             mode="continue", subject="resume",
-            userkey=self._owner_userkey(correlationid),
+            userkey=owner,
         )
         next_seq = len(self.store.events_for(correlationid)) + 1
         return _json(start_response, "202 Accepted", {
@@ -392,12 +417,22 @@ class Handlers:
             session = self.store.get_session(correlationid)
             if session is not None:
                 sess = session["sessionuuid"]
+                owner, unresolved = self._owner_userkey(correlationid)
+                if unresolved:
+                    # The form posts from the transcript page, so the useful answer is
+                    # the page with an error on it rather than a JSON body in the
+                    # browser. Redirecting silently would look like the turn was
+                    # accepted and then vanished, which is the Phase 2 §6.1 class of
+                    # bug this phase keeps trying to avoid.
+                    start_response("503 Service Unavailable",
+                                   [("Content-Type", "text/plain; charset=utf-8")])
+                    return [f"cannot resume {correlationid}: {unresolved}\n".encode()]
                 self.store.upsert_session(correlationid, sess, session["workdir"], None)
                 self.store.insert_prompt(correlationid, "continue", prompt)
                 self.producer.publish_request(
                     prompt=prompt, correlationid=correlationid, sessionuuid=sess,
                     mode="continue", subject="resume",
-                    userkey=self._owner_userkey(correlationid),
+                    userkey=owner,
                 )
         start_response("303 See Other", [("Location", f"/v0/agents/{correlationid}")])
         return [b""]
