@@ -127,6 +127,29 @@ def main() -> int:
     # The `shared` store: single-tenant mode's only store, and multi-tenant mode's home
     # for anything that arrives without a `userkey` (§6.1's `unattributed` path).
     store = stores.for_userkey(None)
+
+    # Seed the ownership index from what is already on disk. REQUIRED for correctness on
+    # the first start after an upgrade, not an optimisation: the index is new and empty
+    # while `sessions.sqlite` still holds every pre-Phase-3 correlation, so without this
+    # `exists()` reports live ids as free and `Minter` can reissue one — overwriting a
+    # session and appending a new prompt to somebody's existing conversation. Phase 2
+    # seeded its `seen` set from the store for exactly this reason, and dropping that loop
+    # without replacing it was a regression in the DEFAULT configuration.
+    #
+    # Cheap after the first run: `INSERT OR IGNORE` over ids the index already holds, and
+    # `all_correlations` is one indexed query per store. The `limit` matches the 10,000
+    # Phase 2 applied to its own seed.
+    seeded = owners.seed_from(store.all_correlations(limit=10000))
+    if topics.multi:
+        # Every tenant's store too, otherwise a tenant's existing ids stay invisible to
+        # the uniqueness check. `known_userkeys` reads the filesystem rather than the LRU,
+        # so a tenant that is merely closed is still seeded.
+        for uk in stores.known_userkeys():
+            seeded += owners.seed_from(
+                stores.for_userkey(uk).all_correlations(limit=10000), uk)
+    if seeded:
+        print(f"[eventbridge] seeded {seeded} pre-existing correlation(s) into the "
+              f"ownership index")
     if topics.multi:
         print(f"[eventbridge] per-user stores under {eb_root}/users "
               f"(max_open={cfg.max_open_stores}), "

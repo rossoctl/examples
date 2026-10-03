@@ -46,6 +46,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS correlation_owner (
   correlationid TEXT PRIMARY KEY,   -- UNIQUE, and deliberately NOT (userkey, corr)
   userkey       TEXT,               -- NULL = single-tenant or the `shared` tier
+  -- Millisecond precision, matching `ce.now_iso()`. At second granularity a batch
+  -- submitted inside one second had arbitrary order among its rows, so
+  -- `ORDER BY created_utc DESC LIMIT n` returned an arbitrary subset -- and
+  -- `submit_members` publishes a whole 100-member batch in a loop, which is exactly
+  -- that case. Ordered reads also tie-break on `rowid`, which is free and total.
   created_utc   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_owner_userkey ON correlation_owner(userkey);
@@ -92,22 +97,35 @@ class OwnerIndex:
         comparison treats NULL and a key as different owners, which is correct: a
         correlation minted in single-tenant mode and later claimed by a tenant is a
         genuine ambiguity, not a no-op.
+
+        **The database is the authority, not the lock.** `ON CONFLICT DO NOTHING` plus a
+        follow-up read means a conflict presents as `Collision` whether or not two writers
+        raced past the in-process lock. An earlier version did `SELECT` then a bare
+        `INSERT`: correct while the lock held, but if two writers ever did race the
+        `INSERT` raised `sqlite3.IntegrityError` rather than `Collision` — and
+        `Minter.mint` catches `Collision` specifically (deliberately, so a broken index is
+        not retried 2000 times), so that path would have surfaced a 500 instead of
+        retrying. §6.5's deletion path and any future sweeper are exactly the second
+        writer that makes this reachable.
         """
         with self._lock:
+            cur = self._c.execute(
+                "INSERT INTO correlation_owner(correlationid,userkey,created_utc) "
+                "VALUES (?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                "ON CONFLICT(correlationid) DO NOTHING",
+                (correlationid, userkey))
+            if cur.rowcount:
+                return
+            # The row already existed. Same owner is idempotent; anything else is a clash.
             row = self._c.execute(
                 "SELECT userkey FROM correlation_owner WHERE correlationid=?",
                 (correlationid,)).fetchone()
-            if row is not None:
-                if row[0] == userkey:
-                    return
-                raise Collision(
-                    f"correlation {correlationid!r} is already owned by "
-                    f"{row[0] or '(single-tenant)'}, cannot claim for "
-                    f"{userkey or '(single-tenant)'}")
-            self._c.execute(
-                "INSERT INTO correlation_owner(correlationid,userkey,created_utc) "
-                "VALUES (?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-                (correlationid, userkey))
+            if row is not None and row[0] == userkey:
+                return
+            raise Collision(
+                f"correlation {correlationid!r} is already owned by "
+                f"{(row[0] if row else None) or '(single-tenant)'}, cannot claim for "
+                f"{userkey or '(single-tenant)'}")
 
     def exists(self, correlationid: str) -> bool:
         """Whether this id is taken by anyone. The `Minter`'s uniqueness check.
@@ -118,6 +136,39 @@ class OwnerIndex:
         return self._c.execute(
             "SELECT 1 FROM correlation_owner WHERE correlationid=? LIMIT 1",
             (correlationid,)).fetchone() is not None
+
+    def seed_from(self, correlationids, userkey: str | None = None) -> int:
+        """Record ids that already exist outside the index. Returns how many were new.
+
+        **This is not an optimisation; it closes a correctness hole.** §2.6 is right that
+        one `SELECT` per mint beats seeding a `seen` set from N stores on every start — but
+        it does not follow that the index never needs seeding *once*. On the first start
+        after an upgrade, `owners.sqlite` is brand new and empty while `sessions.sqlite`
+        still holds every correlation from before, so `exists()` answers "free" for ids
+        that are in use. `Minter.mint` consults nothing else, so it can reissue a live id;
+        `upsert_session` then overwrites that session and the new prompt appends to
+        somebody's existing conversation.
+
+        The id space is 50 adjectives x 50 animals x 10,000 = 25,000,000, so a deployment
+        with ~1,000 existing correlations has roughly a 1-in-25,000 chance per mint.
+        Phase 2's chance was zero, because its `seen` set was seeded from the store — so
+        without this, Phase 3 is a regression in the DEFAULT configuration, which is the
+        one thing the phase promises cannot happen.
+
+        `INSERT OR IGNORE`, so re-seeding is free and a correlation already claimed by a
+        tenant keeps its owner. Seeding assigns `userkey=None` for ids recovered from a
+        single-tenant store, which is the correct owner for them: they predate tenancy.
+        """
+        new = 0
+        with self._lock:
+            for corr in correlationids:
+                cur = self._c.execute(
+                    "INSERT OR IGNORE INTO correlation_owner"
+                    "(correlationid,userkey,created_utc) "
+                    "VALUES (?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    (corr, userkey))
+                new += cur.rowcount or 0
+        return new
 
     # ---- owner-scoped reads (§6.2) -----------------------------------------
 
@@ -143,11 +194,12 @@ class OwnerIndex:
         if userkey is None:
             rows = self._c.execute(
                 "SELECT correlationid FROM correlation_owner WHERE userkey IS NULL "
-                "ORDER BY created_utc DESC LIMIT ?", (limit,)).fetchall()
+                "ORDER BY created_utc DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
         else:
             rows = self._c.execute(
                 "SELECT correlationid FROM correlation_owner WHERE userkey=? "
-                "ORDER BY created_utc DESC LIMIT ?", (userkey, limit)).fetchall()
+                "ORDER BY created_utc DESC, rowid DESC LIMIT ?",
+                (userkey, limit)).fetchall()
         return [r[0] for r in rows]
 
     def userkeys(self) -> list[str]:

@@ -249,7 +249,13 @@ def build_cmd(cfg: Cfg, event, payload: dict, *,
     session = event["sessionuuid"]
     mode = event.get("mode", "start")
     prompt = payload.get("prompt", "")
-    max_turns = payload.get("max_turns") or spec.max_turns
+    # `is not None`, not `or`: `max_turns: 0` is nonsensical input, and with `or` it
+    # silently became the spec's value while the spec path REJECTS zero
+    # (`test_a_nonsensical_max_turns_is_refused`). Two paths disagreeing about the same
+    # bad input is worse than either answer — the HTTP boundary is where it should be
+    # refused, and until then both paths at least agree it is what the caller asked for.
+    req_turns = payload.get("max_turns")
+    max_turns = spec.max_turns if req_turns is None else req_turns
     cmd = [
         cfg.claude_bin, "-p", prompt,
         "--output-format", "stream-json",

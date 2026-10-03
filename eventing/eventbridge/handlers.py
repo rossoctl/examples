@@ -15,6 +15,7 @@ from eventbridge.html_view import render
 from eventbridge.kafka_out import Producer
 from eventbridge.openapi import SWAGGER_HTML, spec
 from eventbridge.store import Store
+from eventrunner import agentspec
 from shared import ce
 
 
@@ -90,6 +91,15 @@ def _read_form(environ) -> dict:
 GROUP_REGEX = CORR_REGEX
 
 
+class _BadRequest(Exception):
+    """A 400 raised from a helper so the caller does not have to thread an error back.
+
+    Only `_agent_for` uses it today. A helper that validates caller input needs some way
+    to refuse, and returning a sentinel would mean every call site remembering to check
+    one — which is the shape of mistake this phase keeps finding.
+    """
+
+
 class Handlers:
     def __init__(self, cfg: Cfg, store: Store, producer: Producer, minter: Minter,
                  groups=None, registry=None, stores=None, owners=None) -> None:
@@ -122,7 +132,17 @@ class Handlers:
         specs a given runner image has baked in.
         """
         if named := (body or {}).get("agent"):
-            return str(named).strip() or None
+            # Validated at the HTTP boundary, where the caller is still listening.
+            # `str(named)` would otherwise accept a dict, a list or `"../../etc"` and ship
+            # it as `ce_agent`; the runner then answers with an asynchronous `phase=error`
+            # event minutes later, which the submitter may never look at, instead of a
+            # `400` on the call that made the mistake.
+            candidate = str(named).strip()
+            try:
+                agentspec.validate_name(candidate)
+            except agentspec.SpecError as e:
+                raise _BadRequest(str(e)) from None
+            return candidate
         if self.registry is not None and caller.userid:
             user = self.registry.by_userkey(caller.userkey) if caller.userkey else None
             if user and user.agent:
@@ -173,8 +193,31 @@ class Handlers:
         if not known:
             return None, (f"{correlationid} is not in the ownership index, so the "
                           f"owning tenant cannot be determined")
-        # A known correlation with a NULL owner is the `shared` tier, which is a real
-        # answer rather than a failure: those events live in `shared/` by design.
+        # A known correlation with a NULL owner is the `shared` tier (or one the mirror
+        # discovered). That is a real answer for READING — its data lives in `shared/` —
+        # and NOT a usable answer for PUBLISHING, because `TopicSet.requests(None)` raises
+        # in multi mode: there is no per-user topic to send a turn to. The two needs
+        # differ, so they are separate methods: `_store_of` resolves a store and accepts
+        # this case, `_publishable_owner` refuses it. Conflating them either makes
+        # shared-tier data unreadable or lets a `/continue` reach the ValueError.
+        return userkey, None
+
+    def _publishable_owner(self, correlationid: str) -> tuple[str | None, str | None]:
+        """The owner to publish a turn for, or a reason it cannot be published.
+
+        Stricter than `_owner_userkey`: in multi mode a correlation with no owning tenant
+        is unpublishable, because there is no per-user requests topic to send to. Refusing
+        here is what stops `TopicSet.requests(None)`'s `ValueError` becoming a WSGI 500
+        with an orphan prompt row already committed — a conversation showing a turn that
+        was never submitted.
+        """
+        userkey, unresolved = self._owner_userkey(correlationid)
+        if unresolved:
+            return None, unresolved
+        if self.cfg.topics.multi and userkey is None:
+            return None, (f"{correlationid} has no owning tenant (it predates tenancy or "
+                          f"belongs to the shared tier), so there is no per-user topic to "
+                          f"publish a turn to")
         return userkey, None
 
     def _store_of(self, correlationid: str):
@@ -224,11 +267,15 @@ class Handlers:
             # Membership before publication: the reverse order leaves a window where a
             # fast agent's terminal event arrives for a member nobody has recorded.
             store.add_group_member(groupid, corr)
+        try:
+            agent = self._agent_for(caller, body)
+        except _BadRequest as e:
+            return _json(start_response, "400 Bad Request", {"error": str(e)})
         event_id = self.producer.publish_request(
             prompt=prompt, correlationid=corr, sessionuuid=sess,
             mode="start", model=model, max_turns=max_turns, subject="start",
             groupid=groupid, submitter=submitter, submitter_iss=sub_iss,
-            userkey=caller.userkey, agent=self._agent_for(caller, body),
+            userkey=caller.userkey, agent=agent,
         )
         out = {
             "correlationid": corr, "sessionuuid": sess,
@@ -277,6 +324,13 @@ class Handlers:
             deadline_s=float(body["deadline_s"]) if body.get("deadline_s") else
                        self.cfg.group_deadline_s,
             idempotency_key=idem,
+            # Without this the group ROW and the groupid's owner-index claim land in the
+            # shared store with a NULL owner while every member row lands in the caller's
+            # store: the batch reports 0 members forever, `maybe_complete` never fires, so
+            # it never completes and never notifies — and a retried POST carrying an
+            # Idempotency-Key reads the tenant store `create` never wrote and returns
+            # `members: []`, which looks like success.
+            userkey=caller.userkey,
         )
         if not created:
             # A retried POST must not launch a second batch.
@@ -286,11 +340,15 @@ class Handlers:
                 "members": [m["correlationid"] for m in snap.get("members") or []],
                 "html_url": f"{self.cfg.public_base_url}/v0/groups/{groupid}",
             })
+        try:
+            agent = self._agent_for(caller, body)
+        except _BadRequest as e:
+            return _json(start_response, "400 Bad Request", {"error": str(e)})
         corrs = self.groups.submit_members(
             groupid, [str(x) for x in prompts],
             max_turns=int(body.get("max_turns", 3)), model=body.get("model"),
             submitter=submitter, submitter_iss=sub_iss,
-            userkey=caller.userkey, agent=self._agent_for(caller, body))
+            userkey=caller.userkey, agent=agent)
         return _json(start_response, "202 Accepted", {
             "groupid": groupid, "created": True, "expected": expected or len(corrs),
             "members": corrs,
@@ -387,11 +445,45 @@ class Handlers:
         out["duration"] = f"{ms / 1000:.1f}s" if ms else None
         return out
 
+    def _authorize_mutation(self, environ, groupid: str):
+        """Gate a route that CHANGES a group. Returns `(userkey, error)`.
+
+        Mutating routes are authorized in `multi` mode even though reads are not yet
+        (§6.2/T7). The distinction matters: T7 is about reads *staying* as open as Phase
+        2's, and Phase 2 had no tenants to cross and no cross-tenant mutation anywhere.
+        An unauthenticated `POST /v0/groups/{gid}/cancel` that resolves any tenant's group
+        from the global index and cancels their queued members is a capability this phase
+        would be *introducing*, not an openness it preserves — so it is refused here
+        rather than deferred.
+
+        `404` for a groupid this caller does not own, matching §6.2: distinguishing
+        "exists but not yours" from "does not exist" lets anyone enumerate live ids
+        across tenants, and the caller learns nothing actionable from the difference.
+        """
+        if self.stores is None:
+            # Single-tenant mode: Phase 2's behaviour, no ownership to check.
+            return None, None
+        caller, status, why = self._caller(environ)
+        if status:
+            return None, (why, status)
+        owner, unresolved = self._owner_userkey(groupid)
+        if unresolved or owner != caller.userkey:
+            return None, ("unknown groupid", 404)
+        return owner, None
+
+    def _mutation_denied(self, start_response, err):
+        reason, status = err
+        if status == 404:
+            return _json(start_response, "404 Not Found", {"error": reason})
+        return _deny(start_response, reason, status)
+
     def close_group(self, environ, start_response, groupid: str, **_):
         if self.groups is None:
             return _json(start_response, "503 Service Unavailable", {"error": "disabled"})
+        owner, err = self._authorize_mutation(environ, groupid)
+        if err:
+            return self._mutation_denied(start_response, err)
         body = _read_json(environ)
-        owner, _ = self._owner_userkey(groupid)
         ok = self.groups.close(groupid,
                                int(body["expected"]) if body.get("expected") else None,
                                userkey=owner)
@@ -400,7 +492,9 @@ class Handlers:
     def cancel_group(self, environ, start_response, groupid: str, **_):
         if self.groups is None:
             return _json(start_response, "503 Service Unavailable", {"error": "disabled"})
-        owner, _ = self._owner_userkey(groupid)
+        owner, err = self._authorize_mutation(environ, groupid)
+        if err:
+            return self._mutation_denied(start_response, err)
         ok = self.groups.cancel(groupid, userkey=owner)
         return _json(start_response, "200 OK", {
             "groupid": groupid, "cancelled": ok,
@@ -419,7 +513,7 @@ class Handlers:
         # One lookup decides both which store holds this conversation and which tenant
         # the resume must be published for. An unplaceable correlation is a 404 — the same
         # answer a foreign one gets (§6.2), so the two are indistinguishable to a client.
-        owner, unresolved = self._owner_userkey(correlationid)
+        owner, unresolved = self._publishable_owner(correlationid)
         store = None if unresolved else (
             self.stores.for_userkey(owner) if self.stores else self.store)
         session = store.get_session(correlationid) if store else None
@@ -446,7 +540,7 @@ class Handlers:
         form = _read_form(environ)
         prompt = form.get("prompt", "").strip()
         if prompt:
-            owner, unresolved = self._owner_userkey(correlationid)
+            owner, unresolved = self._publishable_owner(correlationid)
             if unresolved:
                 # The form posts from the transcript page, so the useful answer is the
                 # page with an error on it rather than a silent 303 — redirecting would

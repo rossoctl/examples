@@ -255,7 +255,9 @@ def test_ntfy_topic_contains_no_identifier():
     """§4.1 is the whole design: the name travels to a phone."""
     t = T.ntfy_topic("kev1", T.userkey("github", "mrsabath"), SECRET)
     assert "mrsabath" not in t
-    assert "gh" not in t.removeprefix("kev1-")
+    # No assertion about the issuer tag: base32's alphabet is `a-z2-7`, so "gh" appears
+    # in 26 random characters about 2.4% of the time. Testing that a 130-bit digest does
+    # not happen to contain a common bigram is a flaky test, not a property.
 
 
 def test_ntfy_topic_is_stable_and_per_user():

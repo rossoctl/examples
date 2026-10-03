@@ -8,8 +8,17 @@
       sessions.sqlite         # sessions, prompts, groups, group_members, transcripts
     gh-aslom-7b2e55a1/
       ...
-  shared/                     # tier `shared` (§3.8), and ALL of single-tenant mode
+  shared/                     # tier `shared` (§3.8), and any unattributable event
+  responses.sqlite            # SINGLE-TENANT mode lives in the bridge root, not shared/
+  sessions.sqlite
+  owners.sqlite               # the global correlationid -> userkey index
 ```
+
+Note where single-tenant mode's files sit: **the bridge root, not `shared/`**. §6.1's
+diagram puts them in `shared/`, and the code deliberately differs — a Phase 2 deployment
+already has `responses.sqlite` and `sessions.sqlite` directly in `{tmpdir}/eventbridge/`,
+so relocating them on upgrade would make every existing session and transcript vanish
+from the UI.
 
 **Why separate files rather than one database with a `userkey` column.** The single-DB
 version is cheaper — one connection pair, one startup, no file-descriptor arithmetic —
@@ -38,6 +47,7 @@ import pathlib
 import threading
 
 from eventbridge.store import Store
+from shared import tenancy
 
 # §6.1 / §8.1 `EB_MAX_OPEN_STORES`. 64 pairs is ~192 file descriptors with WAL, which
 # leaves comfortable room under a 1024 soft limit for the Kafka sockets, the HTTP
@@ -51,14 +61,19 @@ SHARED = "shared"
 
 
 class StoreRegistry:
-    """`userkey -> Store`, opened on demand, closed on an LRU.
+    """`userkey -> Store`, opened on demand, evicted on an LRU.
 
-    Closing is safe because a `Store` is stateless above SQLite — every method opens a
-    transaction and commits, so there is no in-memory state to lose. The ONE thing that
-    is not: `Store.subscribe()` holds `threading.Event`s for live SSE viewers, so a store
-    with subscribers is **pinned** and exempt from eviction. Evicting it would make an
-    open transcript page stop updating with no error anywhere — the Phase 2 §6.1 class of
-    bug, where the symptom looks like lost events rather than like a closed file.
+    **Eviction drops the registry's reference; it does not close the store.** §6.1 says
+    the LRU "closes" and that "closing is safe because a Store is stateless above SQLite".
+    The first half is no longer what the code does and the second was disproven: a handler
+    holds a store across several calls, so a concurrent request for another tenant could
+    close it mid-use and the next call failed with `ProgrammingError: Cannot operate on a
+    closed database`. See `_evict_if_needed` for the full argument.
+
+    A store with live SSE subscribers is additionally **pinned** — kept in the cache, not
+    merely uncollected — so a later reader resolves the SAME object and therefore sees the
+    subscriber's notifications. Evicting it would leave an open page watching an object
+    nothing writes to any more: updates stop with no error, the Phase 2 §6.1 symptom class.
     """
 
     def __init__(self, root: str | pathlib.Path, *,
@@ -88,10 +103,17 @@ class StoreRegistry:
         in `{tmpdir}/eventbridge/`, and relocating them on upgrade would make every
         existing session and transcript vanish from the UI. Multi-tenant mode is new, so
         it is free to use the `users/<userkey>/` layout.
+
+        **The key is validated before it reaches the join.** It can arrive from an inbound
+        Kafka header, and `Store.__init__` calls `mkdir(parents=True)`, so a key containing
+        `..` would create and then write to a directory inside another tenant's store or
+        outside the tree entirely. An invalid key is treated exactly like a missing one
+        rather than raising, so a forged value lands in `shared/`, bumps `unattributed`
+        and is visible — see `for_event`.
         """
         if not self._multi:
             return self._root
-        if not userkey:
+        if not tenancy.is_valid_userkey(userkey):
             return self._root / SHARED
         return self._root / "users" / userkey
 
@@ -123,9 +145,12 @@ class StoreRegistry:
             return store
 
     def _cache_key(self, userkey: str | None) -> str:
+        """The LRU key. Must agree with `_dir_for` about where a key maps, or an invalid
+        one would get its own cache entry whose Store points at `shared/` — two entries,
+        one directory, and SQLite connections to the same files from both."""
         if not self._multi:
             return SHARED
-        return userkey or SHARED
+        return userkey if tenancy.is_valid_userkey(userkey) else SHARED
 
     def for_event(self, event) -> Store:
         """The store an inbound response belongs in, from its `ce_userkey`.
@@ -139,7 +164,11 @@ class StoreRegistry:
         from shared import ce
         getter = getattr(event, "get", None)
         userkey = getter(ce.EXT_USERKEY) if getter else None
-        if self._multi and not userkey:
+        # An INVALID key counts as unattributed too, not just a missing one. It is
+        # truthy, so a bare `not userkey` check would let a forged `../..` sail through
+        # to the path join uncounted — the forgery has to be visible, which is the whole
+        # point of the counter.
+        if self._multi and not tenancy.is_valid_userkey(userkey):
             with self._lock:
                 self.unattributed += 1
         return self.for_userkey(userkey)

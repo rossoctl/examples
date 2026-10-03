@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -194,8 +195,26 @@ def load() -> Cfg:
             f"EB_TENANCY_MODE must be {tenancy.SINGLE!r} or {tenancy.MULTI!r}, "
             f"got {cfg.tenancy_mode!r}. See DESIGN_PHASE3.md §8.1.")
     cfg.topic_prefix = e("EB_TOPIC_PREFIX", cfg.topic_prefix)
+    # The prefix is the one component of a topic name `tenancy._slug` never sees, so it
+    # is validated here instead. A prefix containing `_` or `.` produces exactly the JMX
+    # metric-name collision that `_slug`'s docstring warns about (`a.b_c` and `a_b.c`
+    # flatten to the same metric and one silently overwrites the other), and a space or
+    # `/` is simply an illegal topic name.
+    if not re.fullmatch(r"[a-zA-Z0-9-]{1,32}", cfg.topic_prefix or ""):
+        raise SystemExit(
+            f"EB_TOPIC_PREFIX must be 1-32 of [a-zA-Z0-9-], got "
+            f"{cfg.topic_prefix!r}. `.` and `_` are excluded on purpose: Kafka's JMX "
+            f"metric names flatten both, so two topics differing only in which one they "
+            f"use silently share one metric. See DESIGN_PHASE3.md §3.1.")
     cfg.user_registry_path = e("EB_USER_REGISTRY_PATH", cfg.user_registry_path)
-    cfg.max_open_stores = int(e("EB_MAX_OPEN_STORES", str(cfg.max_open_stores)))
+    # Readable refusal rather than a bare ValueError traceback, matching every other
+    # refusal on this startup path.
+    try:
+        cfg.max_open_stores = int(e("EB_MAX_OPEN_STORES", str(cfg.max_open_stores)))
+    except ValueError:
+        raise SystemExit(
+            f"EB_MAX_OPEN_STORES must be an integer, got "
+            f"{e('EB_MAX_OPEN_STORES')!r}") from None
 
     cfg.ntfy.enabled  = (e("NTFY_ENABLED", "true" if cfg.ntfy.enabled else "false").lower() == "true")
     cfg.ntfy.base_url = e("NTFY_BASE_URL", cfg.ntfy.base_url)

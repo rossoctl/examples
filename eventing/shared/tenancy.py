@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 
 # Short issuer tags. Two characters so the readable middle of the key keeps as much
 # room as possible, and in the key at all so a human reading `kubectl get kafkatopics`
@@ -66,8 +67,13 @@ def _canonicalise(issuer: str, userid: str) -> str:
       part byte-exact. One human with two spellings therefore gets two tenants, which
       is wasteful, not unsafe. The unsafe direction (two humans, one tenant) is what the
       digest in `userkey` makes impossible.
-    * **Static** identities are byte-exact: an operator typed them, and normalising
-      somebody's hand-written string on their behalf is how you merge two of them.
+    * **Static** identities are byte-exact — *unless they are address-shaped*. The `@`
+      branch above is checked before the issuer, so a static `EB_AUTH_TOKENS` name of
+      `Ops@Example.COM` canonicalises to `Ops@example.com` rather than byte-exact. That
+      is deliberate: the email rule applies to anything containing `@` whatever the
+      issuer, because an operator who types an address means an address. Everything else
+      from a static issuer is left exactly as typed — normalising somebody's
+      hand-written string on their behalf is how you merge two of them.
 
     `rpartition` rather than `partition` because the local part of an address may itself
     contain `@` when quoted; the domain is what follows the LAST one.
@@ -148,6 +154,42 @@ def userkey(issuer: str, userid: str) -> str:
     # `gh--a1b2c3d4`: still unique thanks to the digest, but not a legal label.
     slug = _slug(canon)[:_SLUG_MAX].strip("-") or "u"
     return f"{iss}-{slug}-{digest}"
+
+
+# The exact shape `userkey()` produces: `<2-letter iss>-<slug>-<8 hex>`. Exported as a
+# validator because this module is "the ONLY place an identity becomes a name" and a
+# producer's guarantee is worth nothing if no consumer can check it.
+#
+# The slug is at most _SLUG_MAX characters, starts with an alphanumeric (`_slug` strips
+# leading dashes) and contains only `[a-z0-9-]`.
+USERKEY_RE = re.compile(
+    rf"^[a-z]{{2}}-[a-z0-9][a-z0-9-]{{0,{_SLUG_MAX - 1}}}-[0-9a-f]{{{_DIGEST_HEX}}}$")
+
+
+def is_valid_userkey(value: str | None) -> bool:
+    """Whether `value` is a key this module could have produced.
+
+    **This is a security gate, not a type check.** A `userkey` reaches a filesystem path
+    join (`store_registry._dir_for`) and in multi-tenant mode it arrives from an inbound
+    Kafka header, so an unvalidated one containing `..` escapes `users/` into another
+    tenant's store — or out of the tree entirely, since `Store.__init__` calls
+    `mkdir(parents=True)` and therefore creates the directory rather than rejecting it.
+
+    Two reasons that is reachable rather than theoretical:
+
+    * `userkey` is in `signing.SIGNED_ATTRS`, but `EB_REQUIRE_RESPONSE_SIGNATURE` defaults
+      to `false` and audit mode stores the event unchanged — verification is what would
+      catch the forgery and it is off by default.
+    * §3.6 concedes that in Tier A anything with network access to the shared broker can
+      write to any topic. That is an accepted property for *reading* events; it must not
+      also be a filesystem write primitive.
+
+    Callers treat an invalid key exactly like a missing one — the `shared` store plus the
+    `unattributed` counter — so a forged value is counted and visible rather than acted on.
+    Note that an invalid key is *truthy*, so it would otherwise sail past a `if not
+    userkey` check straight into the join.
+    """
+    return bool(value) and bool(USERKEY_RE.fullmatch(value))
 
 
 def ntfy_topic(prefix: str, userkey: str, secret: bytes) -> str:

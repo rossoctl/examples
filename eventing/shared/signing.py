@@ -201,12 +201,23 @@ SIGNED_ATTRS = ("specversion", "type", "source", "id", "time", "subject",
                 # upgrade both services together. With signing off (the default) there
                 # is nothing to coordinate, which is most deployments.
                 #
-                # Both have to be here rather than merely present on the event:
+                # All three have to be here rather than merely present on the event:
                 # `userkey` decides which store a response is written into and which
                 # ntfy topic announces it, so a mutable one lets anything with topic
                 # write access file events into another user's history. `depth` is the
                 # hop limit, and a resettable hop limit does not limit hops.
-                "userkey", "depth")
+                #
+                # `agent` selects the AgentSpec, and §5.1 calls the tool policy "the
+                # sandbox": the spec supplies `--permission-mode`, `--allowedTools`,
+                # `--disallowedTools`, `--settings` and `--mcp-config`. Outside this set,
+                # anything with write access to a requests topic could rewrite `ce_agent`
+                # to name a baked spec with `permission_mode = "bypassPermissions"` and no
+                # `disallowed_tools` — and THE SIGNATURE WOULD STILL VERIFY, so the runner
+                # executes the forged policy as an approved request. That makes the signed
+                # configuration worse than the unsigned one, because an operator believes
+                # it is attested. Added in the same change as the other two, per §8.3's
+                # one-canonicalisation-break rule.
+                "userkey", "depth", "agent")
 
 
 def data_bytes(data: Any) -> bytes:
