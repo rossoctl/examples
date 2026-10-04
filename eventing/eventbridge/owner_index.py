@@ -51,7 +51,10 @@ CREATE TABLE IF NOT EXISTS correlation_owner (
   -- `ORDER BY created_utc DESC LIMIT n` returned an arbitrary subset -- and
   -- `submit_members` publishes a whole 100-member batch in a loop, which is exactly
   -- that case. Ordered reads also tie-break on `rowid`, which is free and total.
-  created_utc   TEXT NOT NULL
+  created_utc   TEXT NOT NULL,
+  -- A TOMBSTONE marks a correlation whose data is gone but whose id must never be
+  -- reissued. See `forget`: reuse is unsafe because `sessionuuid` is unsalted.
+  deleted_utc   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_owner_userkey ON correlation_owner(userkey);
 """
@@ -83,6 +86,13 @@ class OwnerIndex:
         self._c.execute("PRAGMA journal_mode=WAL")
         self._c.execute("PRAGMA synchronous=NORMAL")
         self._c.executescript(_SCHEMA)
+        # `CREATE TABLE IF NOT EXISTS` is a no-op on an existing file, so a column added
+        # after one was created needs an explicit ALTER — the same idiom `store.py` uses
+        # for `prompts.submitter`. Idempotent: SQLite raises when it already exists.
+        try:
+            self._c.execute("ALTER TABLE correlation_owner ADD COLUMN deleted_utc TEXT")
+        except sqlite3.OperationalError:
+            pass
         # EventBridge is single-replica (Phase 1 §8.6) but multi-threaded: the HTTP
         # worker pool and the responses consumer both reach this. `isolation_level=None`
         # means autocommit, so the lock is what makes claim's check-then-insert atomic.
@@ -193,7 +203,8 @@ class OwnerIndex:
         """Every correlation a tenant owns, newest first. Backs the group-list filter."""
         if userkey is None:
             rows = self._c.execute(
-                "SELECT correlationid FROM correlation_owner WHERE userkey IS NULL "
+                "SELECT correlationid FROM correlation_owner "
+                "WHERE userkey IS NULL AND deleted_utc IS NULL "
                 "ORDER BY created_utc DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
         else:
             rows = self._c.execute(
@@ -210,23 +221,52 @@ class OwnerIndex:
         return [r[0] for r in rows]
 
     def forget(self, correlationid: str) -> None:
-        """Drop one mapping. For §6.5's deletion path.
+        """Tombstone one mapping: clear the owner, keep the id reserved. §6.5.
 
-        Note what this does NOT do: freeing the id for reuse is deliberate, since the
-        uniqueness guarantee only has to hold for correlations that still exist. The
-        caller is responsible for having removed the data first — this is the last step,
-        not the first.
+        **The id is never reissued, and that is the whole point.** An earlier version
+        `DELETE`d the row and its docstring claimed "freeing the id for reuse is
+        deliberate" — which was both wrong about the code's intent and unsafe. `exists()`
+        is the `Minter`'s only uniqueness check, so a deleted row frees the id; and
+        because `sessionuuid = uuid5(NAMESPACE, correlationid)` is **unsalted** by design
+        (§2.6), a reissued `correlationid` derives *the same session uuid* as the deleted
+        one. A `claude` transcript left on a runner's volume, or a checkpoint that
+        outlived the delete, is then resumable by the new correlation — one user's
+        conversation continuing inside somebody else's agent.
+
+        Tombstoning costs one short row per deleted correlation and removes the whole
+        class. The alternative — guaranteeing every transcript keyed on that uuid is
+        purged everywhere, including volumes this process does not own — is not a
+        guarantee this component can make.
+
+        The owner is cleared so a tombstone leaks nothing about who the correlation
+        belonged to, which matters because §6.5 is a deletion path.
         """
         with self._lock:
-            self._c.execute("DELETE FROM correlation_owner WHERE correlationid=?",
-                            (correlationid,))
+            self._c.execute(
+                "UPDATE correlation_owner "
+                "SET userkey=NULL, deleted_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE correlationid=?", (correlationid,))
 
     def forget_tenant(self, userkey: str) -> int:
-        """Drop every mapping for one tenant, returning how many. §6.5's `rm -rf` half."""
+        """Tombstone every mapping for one tenant, returning how many. §6.5's `rm -rf`.
+
+        Same reasoning as `forget`: the rows stay as tombstones so none of the tenant's
+        ids can be reissued, and the owner is cleared so the tombstones say nothing about
+        whose they were.
+        """
         with self._lock:
             cur = self._c.execute(
-                "DELETE FROM correlation_owner WHERE userkey=?", (userkey,))
+                "UPDATE correlation_owner "
+                "SET userkey=NULL, deleted_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE userkey=?", (userkey,))
             return cur.rowcount or 0
+
+    def is_tombstoned(self, correlationid: str) -> bool:
+        """Whether this id is reserved by a deleted correlation."""
+        row = self._c.execute(
+            "SELECT deleted_utc FROM correlation_owner WHERE correlationid=?",
+            (correlationid,)).fetchone()
+        return bool(row and row[0])
 
     def count(self) -> int:
         return int(self._c.execute(

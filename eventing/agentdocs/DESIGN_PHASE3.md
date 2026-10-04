@@ -1499,6 +1499,17 @@ store can be chosen. It holds nothing but the mapping.
   that substitute implements. Reachable only from test doubles — `__main__` always builds a
   real `Minter` with an index — but recorded here because §2.6 is where the guarantee is
   claimed.
+- **Deletion tombstones; it never frees an id for reuse.** This is a §6.5 decision that
+  belongs here because the index is what enforces it. `forget()` clears the owner and sets
+  `deleted_utc`, keeping the row, because `exists()` is the `Minter`'s only uniqueness
+  check and **`sessionuuid` is unsalted**: a reissued `correlationid` derives *the same
+  session uuid* as the deleted one. A `claude` transcript left on a runner's volume, or a
+  checkpoint that outlived the delete, would then be resumable by the new correlation —
+  one user's conversation continuing inside somebody else's agent. The alternative is
+  guaranteeing every transcript keyed on that uuid is purged everywhere, including volumes
+  EventBridge does not own, which is not a guarantee this component can make. The cost is
+  one short row per deleted correlation. The owner is cleared so a tombstone discloses
+  nothing about whose the correlation was, which matters on a deletion path.
 
 The alternative is one database with a `userkey` column and a `WHERE` clause on every
 query. It is cheaper — one connection pair, one startup, no file-descriptor arithmetic —

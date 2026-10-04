@@ -163,7 +163,8 @@ def main() -> int:
                         topics=topics)
     groups = GroupService(cfg, store, producer, minter, stores=stores)
 
-    ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store)
+    ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store,
+                         stores=stores if topics.multi else None)
     if cfg.ntfy.enabled and cfg.ntfy.topic:
         ntfy.start()
 
@@ -181,7 +182,8 @@ def main() -> int:
     # Back-fill prompts from the requests topic — also gives us prompt visibility
     # for correlations we didn't originate ourselves.
     requests_mirror = RequestsMirror(cfg.kafka_bootstrap, cfg.request_topic, store,
-                                     topics=topics)
+                                     topics=topics,
+                                     stores=stores if topics.multi else None)
     requests_mirror.start()
 
     # §21.2: rebuild group history from the responses topic. The live consumer above

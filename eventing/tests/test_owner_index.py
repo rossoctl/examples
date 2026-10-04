@@ -107,10 +107,28 @@ def test_userkeys_excludes_the_null_owner(idx):
 
 # ---- deletion (§6.5 groundwork) ------------------------------------------
 
-def test_forget_one(idx):
+def test_forget_tombstones_rather_than_freeing_the_id(idx):
+    """The id must NEVER be reissued. `sessionuuid` is unsalted (§2.6), so a reused
+    `correlationid` derives the same session uuid as the deleted one — and a transcript
+    left on a runner's volume is then resumable by the new correlation, continuing one
+    user's conversation inside somebody else's agent."""
     idx.claim(CORR, A)
     idx.forget(CORR)
-    assert not idx.exists(CORR)
+    assert idx.exists(CORR), "the id was freed for reuse"
+    assert idx.is_tombstoned(CORR)
+    # The owner is cleared: a tombstone must not say whose the correlation was.
+    assert idx.owner_of(CORR) == (None, True)
+    assert CORR not in idx.correlations_for(A)
+    assert CORR not in idx.correlations_for(None), "a tombstone is not a live shared row"
+
+
+def test_the_minter_will_not_reissue_a_tombstoned_id(idx):
+    """The property the tombstone exists for, through the Minter rather than the index."""
+    from eventbridge.owner_index import Collision
+    idx.claim(CORR, A)
+    idx.forget(CORR)
+    with pytest.raises(Collision):
+        idx.claim(CORR, B)
 
 
 def test_forget_tenant_returns_a_count_and_leaves_others(idx):
@@ -119,6 +137,27 @@ def test_forget_tenant_returns_a_count_and_leaves_others(idx):
     idx.claim("brave-otter-0003", B)
     assert idx.forget_tenant(A) == 2
     assert idx.correlations_for(B) == ["brave-otter-0003"]
+    # A's ids stay reserved, and stop being attributed to A.
+    assert idx.correlations_for(A) == []
+    for c in ("brave-otter-0001", "brave-otter-0002"):
+        assert idx.exists(c) and idx.is_tombstoned(c)
+
+
+def test_the_deleted_column_is_added_to_an_existing_index(tmp_path):
+    """An index created before tombstoning gains the column by ALTER, as `store.py`
+    does for `prompts.submitter`."""
+    import sqlite3
+    (tmp_path / "owners.sqlite").unlink(missing_ok=True)
+    c = sqlite3.connect(tmp_path / "owners.sqlite")
+    c.execute("CREATE TABLE correlation_owner (correlationid TEXT PRIMARY KEY, "
+              "userkey TEXT, created_utc TEXT NOT NULL)")
+    c.execute("INSERT INTO correlation_owner VALUES ('brave-otter-0001', 'gh-a-1', 'x')")
+    c.commit()
+    c.close()
+    idx = OwnerIndex(tmp_path)
+    assert idx.owner_of("brave-otter-0001") == ("gh-a-1", True)
+    idx.forget("brave-otter-0001")
+    assert idx.is_tombstoned("brave-otter-0001")
 
 
 # ---- persistence ---------------------------------------------------------

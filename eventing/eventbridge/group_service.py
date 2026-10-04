@@ -80,13 +80,20 @@ class GroupService:
                 data={"label": label, "expected": expected, "min_success": min_success,
                       "deadline_utc": deadline},
                 userkey=userkey)
-        except TypeError:
-            # NOT swallowed. A TypeError here is a signature mismatch between this call
-            # and the producer — a programming error, not a broker being down — and the
-            # broad `except` below would turn it into a group that silently never
-            # announces itself. Phase 3 hit exactly that while adding `userkey`: every
-            # group event stopped being published and the only symptom was a batch that
-            # never completed. Loud is correct for this one.
+        except (TypeError, ValueError):
+            # NOT swallowed. Both are programming errors rather than a broker being down,
+            # and the broad `except` below would turn either into a group that silently
+            # never announces itself:
+            #
+            #  * TypeError  — a signature mismatch between this call and the producer.
+            #    Phase 3 hit exactly that while adding `userkey`: every group event
+            #    stopped publishing and the only symptom was a batch that never completed.
+            #  * ValueError — `TopicSet` refusing to name a topic without a userkey in
+            #    multi mode. That means a caller failed to pass one, which is the
+            #    `create_group` defect the #883 review found; logging it would hide the
+            #    cause and leave the same silent never-completing batch.
+            #
+            # Loud is correct for both. A genuine broker failure is still handled below.
             raise
         except Exception as e:  # noqa: BLE001 - the group still exists in the store
             _log(f"could not publish group.started for {groupid}: {e!r}")
@@ -210,12 +217,13 @@ class GroupService:
                       "elapsed_s": p["elapsed_s"], "elapsed": p["elapsed"],
                       "slowest_member_s": _slowest(members)},
                 userkey=userkey)
-        except TypeError:
-            # See `_publish_started`: a signature mismatch is a programming error and
-            # must not be downgraded into "this batch never announced it finished". The
-            # guard is repeated at both call sites rather than factored into a helper,
-            # because what it protects is the argument list of *this* call, and a wrapper
-            # would move the mismatch one frame away from the arguments that caused it.
+        except (TypeError, ValueError):
+            # See `_publish_started`: a signature mismatch or a missing userkey is a
+            # programming error and must not be downgraded into "this batch never
+            # announced it finished". The guard is repeated at both call sites rather than
+            # factored into a helper, because what it protects is the argument list of
+            # *this* call, and a wrapper would move the mismatch one frame away from the
+            # arguments that caused it.
             raise
         except Exception as e:  # noqa: BLE001
             _log(f"could not publish group.completed for {groupid}: {e!r}")

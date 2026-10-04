@@ -205,32 +205,105 @@ def test_no_phase3_secret_is_inlined_into_a_manifest():
         for var in SECRET_PATH_VARS:
             # Referencing the variable is fine; giving it a literal sibling value is
             # not. A `secretKeyRef` has no `value:` on the same key.
-            for bad in (f"{var}:", f"name: {var}\n          value:"):
-                assert bad not in rendered, \
-                    f"{overlay} appears to inline {var} rather than mounting a Secret"
+            #
+            # `\s*` rather than hardcoded indentation: ten spaces matches the demo
+            # overlay's container `env:` today, but the same variable inlined in an
+            # initContainer, a sidecar or a deeper patch would pass silently.
+            # test_manifests.py's own earlier tests use `\s*` for this reason.
+            inlined = re.search(rf"name:\s*{re.escape(var)}\s*\n\s*value:", rendered)
+            assert f"{var}:" not in rendered and not inlined, \
+                f"{overlay} appears to inline {var} rather than mounting a Secret"
+
+
+#: Variables that pre-date §8.3 and are therefore out of its scope. Retro-classifying all
+#: 36 is a separate change from making the rule hold for anything new, so they are listed
+#: here explicitly — and `test_the_baseline_list_is_still_accurate` keeps the list honest
+#: by checking it against the config files rather than trusting it.
+PRE_PHASE3_VARS = (
+    "EB_ALLOWED_USERS", "EB_AUTH_TOKENS", "EB_GITHUB_CACHE_TTL_S",
+    "EB_GITHUB_CLIENT_ID", "EB_GROUP_DEADLINE_S", "EB_HTTP_ADDR",
+    "EB_REQUIRE_RESPONSE_SIGNATURE", "EB_SIGNING_KEY_PATH", "EB_SIGNING_KID",
+    "EB_TRANSCRIPT_MAX_BYTES", "EB_VERIFY_KEYSET_PATH", "EB_WORKERS",
+    "ER_COMMIT_AFTER_TERMINAL", "ER_CONSUMER_GROUP", "ER_DEDUPE_FINAL_TEXT",
+    "ER_DRAIN_TIMEOUT_S", "ER_EMIT_SYSTEM_HOOKS", "ER_EVENTBRIDGE_URL",
+    "ER_FINAL_COMMIT_WAIT_S", "ER_HEARTBEAT_MAX_AGE_S", "ER_HEARTBEAT_PATH",
+    "ER_INCLUDE_RAW", "ER_KAFKA_RETRY_INITIAL_S", "ER_KAFKA_RETRY_MAX_S",
+    "ER_MAX_CONCURRENT", "ER_MAX_REQUEST_AGE_S", "ER_MOCK_CLAUDE",
+    "ER_MOCK_DELAY_MAX_S", "ER_MOCK_DELAY_MIN_S", "ER_REQUIRE_SIGNATURE",
+    "ER_SIGNING_KEY_PATH", "ER_SIGNING_KID", "ER_TRANSCRIPT_MAX_BYTES",
+    "ER_TRANSCRIPT_SYNC", "ER_VERIFY_KEYSET_PATH", "ER_VERIFY_KEY_PATH",
+)
+
+
+def _vars_read(path: pathlib.Path) -> set[str]:
+    """Every `EB_*`/`ER_*` name a config file reads via the `e("VAR")` idiom."""
+    return set(re.findall(r'e\("((?:EB|ER)_[A-Z0-9_]+)"', path.read_text()))
+
+
+def test_the_baseline_list_is_still_accurate():
+    """A stale `PRE_PHASE3_VARS` entry silently widens the exemption above.
+
+    If a pre-Phase-3 variable is removed from `config.py` and left here, it keeps
+    exempting a name nobody reads — harmless — but if one is *renamed*, the new name
+    becomes unclassified and the check above catches it. This asserts the simpler
+    property: every name here is still read somewhere.
+    """
+    found = (_vars_read(ROOT / "eventbridge" / "config.py")
+             | _vars_read(ROOT / "eventrunner" / "config.py"))
+    stale = set(PRE_PHASE3_VARS) - found
+    assert not stale, (
+        f"{sorted(stale)} are in PRE_PHASE3_VARS but no config.py reads them; "
+        f"remove them so the §8.3 exemption stays as narrow as it should be")
 
 
 def test_every_phase3_variable_is_classified():
-    """A variable that is in neither list is one nobody decided about.
+    """A variable in neither list is one nobody answered the §8.3 question about.
 
-    §8.3's rule only works if adding a variable forces the Secret-vs-ConfigMap question,
-    so this asserts the two lists together cover what `config.py` actually reads.
+    **Both directions matter, and only one of them enforces the rule.**
+    `CONFIGMAP_VARS ⊆ found` catches a stale entry here. The direction that catches a NEW
+    variable classified as neither is `found ⊆ CONFIGMAP_VARS ∪ SECRET_PATH_VARS` — which
+    is the case this test exists for, and which an earlier version of it did not check.
     """
-    import re as _re
-    sources = [(ROOT / "eventbridge" / "config.py").read_text(),
-               (ROOT / "eventrunner" / "config.py").read_text()]
-    found = set()
-    for src in sources:
-        found |= set(_re.findall(r'e\("((?:EB|ER)_[A-Z0-9_]+)"', src))
+    eb = ROOT / "eventbridge" / "config.py"
+    er = ROOT / "eventrunner" / "config.py"
+    found = _vars_read(eb) | _vars_read(er)
+
+    # The sanity check that this test is looking at the right thing at all. If the
+    # `e("VAR")` idiom ever changes, `found` goes empty and every assertion below passes
+    # vacuously — so fail loudly here instead.
+    assert "EB_TENANCY_MODE" in found and len(found) > 10, \
+        'config.py does not look like it was parsed; did the `e("VAR")` idiom change?'
+
     # Every ConfigMap-side variable must actually be read by the code — a stale entry
     # here would silently stop checking anything. The Secret-side ones are deliberately
     # exempt: they are declared ahead of the tasks that introduce them (see the note on
     # SECRET_PATH_VARS), and requiring them now would just force a placeholder read.
     for var in CONFIGMAP_VARS:
         assert var in found, f"{var} is listed here but no config.py reads it"
-    # The sanity check that this test is looking at the right thing at all.
-    assert "EB_TENANCY_MODE" in found and len(found) > 10, \
-        "config.py does not look like it was parsed; did the `e(\"VAR\")` idiom change?"
+
+    # THE DIRECTION THAT ENFORCES §8.3. Scoped to variables Phase 3 introduced: the
+    # pre-Phase-3 ones pre-date the rule, and retro-classifying 36 of them is a separate
+    # change from making the rule hold for new ones.
+    baseline = set(PRE_PHASE3_VARS)
+    unclassified = found - set(CONFIGMAP_VARS) - set(SECRET_PATH_VARS) - baseline
+    assert not unclassified, (
+        f"{sorted(unclassified)} are read by config.py but classified as neither "
+        f"ConfigMap nor Secret. DESIGN_PHASE3.md §8.3 requires the question be answered: "
+        f"add each to CONFIGMAP_VARS or SECRET_PATH_VARS in this file.")
+
+
+def test_the_classification_check_can_actually_fail():
+    """The deliberate-failure check the review asked for.
+
+    A test whose failure mode has never been observed is a test nobody should trust —
+    `test_every_phase3_variable_is_classified` replaced an assertion that could not fail
+    for its stated reason, so this one proves the replacement does.
+    """
+    baseline = set(PRE_PHASE3_VARS)
+    pretend_found = {"EB_TENANCY_MODE", "EB_SOMETHING_NEW_X"} | baseline
+    unclassified = pretend_found - set(CONFIGMAP_VARS) - set(SECRET_PATH_VARS) - baseline
+    assert unclassified == {"EB_SOMETHING_NEW_X"}, \
+        "an unclassified new variable must be detected"
 
 
 @needs_kubectl
