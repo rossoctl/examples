@@ -442,3 +442,79 @@ knowing before a demo.
 - **Finishing agent identity?** §4.2 for the blocker, then §4.4 in order.
 - **Presenting it?** §2.6 and §3 — what the controls do *not* prove. A security
   demo that oversells its guarantee is worse than one that does not exist.
+
+---
+
+## 8. What the docs review found (added after rossoctl/rossoctl#2609)
+
+Writing the user-facing pages for this path meant restating every claim in this
+document for a reader who cannot see the code. Six review rounds then checked each
+restated claim **by running it**, against `eventing/` at `d9677ddd`. Thirteen did
+not hold.
+
+They are recorded here rather than edited into §3 and §4.4 in place, so the reasoning
+above stays readable as the record of what was intended, and this section says what
+the code does.
+
+### 8.1 Promises in §4.4 that the code does not keep
+
+| §4.4 says | The code does | Issue |
+|---|---|---|
+| "A keyset alone verifies **and logs**" | Verifies and returns a verdict. Nothing is logged or counted, so the observable reject rate the two-flag rollout depends on does not exist. | [#886](https://github.com/rossoctl/examples/issues/886) |
+| The verifier accepts "**only**" EventBridge's kid for group events, so an approved runner "cannot forge a `group.completed` and end a batch early" | Flags it, then applies it anyway. `kafka_in.py` rewrites `phase`/`data` but keeps `final` and `groupid`, so the rewritten event still reaches `on_group_event`. The group mirror replays group events unverified on restart. | [#885](https://github.com/rossoctl/examples/issues/885) |
+| Step 2: "this proves *who finished a run*" | Not once stored. `insert_response` uses `INSERT OR REPLACE` on `(correlationid, sequence)`, so a later **unsigned** frame reusing a sequence number replaces the verified terminal row. | [#885](https://github.com/rossoctl/examples/issues/885) |
+| "EventBridge refuses to start with a keyset but no `EB_SIGNING_KID`" | True — but nothing checks that the kid is *in* the keyset. EventBridge starts, then flags its own group events. | [#888](https://github.com/rossoctl/examples/issues/888) |
+
+A fifth, promised nowhere but worse than any of them:
+
+**`EB_REQUIRE_RESPONSE_SIGNATURE=true` with no keyset refuses nothing.** The decision
+is only reached when a keyset is loaded — `kafka_in.py` has `ok, why = True, "not
+checked"` behind `if self._keyset is not None` — so `require` is never consulted. A
+forged terminal response is stored as an answer, and the startup line says `response
+verification OFF`. The request side does the opposite: with `ER_REQUIRE_SIGNATURE=true`
+and no key at all, `verify_event` refuses every request. **The two sides fail in
+opposite directions, and only one of them is loud.**
+([#888](https://github.com/rossoctl/examples/issues/888))
+
+### 8.2 §3's "deliberately left open" is wider than stated
+
+- **§3.1's capability-URL argument rests on ids being unguessable.** `GET /v0/groups`
+  returns the 100 most recent groups without sign-in, and `GET /v0/groups/{id}/status`
+  lists every member's correlation id. For any conversation in a group, the capability
+  is published. ([#887](https://github.com/rossoctl/examples/issues/887))
+- **§3.2 understates what `PUT /transcript` allows.** It is the checkpoint EventRunner
+  **resumes from** on a cold pod, so an unauthenticated write changes what the agent
+  continues with. Request signing does not cover it.
+  ([#887](https://github.com/rossoctl/examples/issues/887))
+- **Group-member push suppression is defeated by omitting an attribute.** `ntfy.py`
+  decides on the *event's own* `ce_groupid`, not on group membership. A forged
+  non-terminal frame without it is pushed, stored in the member's transcript and shown
+  on the group page; a forged terminal without it is pushed at priority 5 even with
+  `NTFY_GROUP_NOTIFY_ERRORS` off, and does not count the member as failed.
+
+### 8.3 Three things about the keys
+
+- **§2.6 records `submitter`/`submitteriss` as unsigned.** They joined `SIGNED_ATTRS`
+  in §4.2, so the signature covers them. The limit that remains is a different one and
+  worth stating as such: a signature proves EventBridge *asserted* the name.
+- **§4.3's "the verification code does not change" under SPIRE does not hold.** The
+  verifier accepts EdDSA only, and SPIRE issues EC or RSA keys. The keyset is also a
+  flat JSON map of kid to key, and `keyset.load` rejects a JWKS document outright. The
+  kid lookup survives; the algorithm and the file format do not.
+- **A flat keyset makes the asymmetric keys attribution, not restriction.** §4.4 step 5
+  says a flat keyset "is not enough" for group events, and pins them. The same
+  reasoning applies to member answers and is not drawn: EventBridge's own key is in
+  `EB_VERIFY_KEYSET_PATH` by requirement, so it verifies on any run's answer, as does
+  any approved runner's key.
+
+### 8.4 Why this is worth the space
+
+Every item above is a claim this document made that a reader could have relied on. The
+pattern is not carelessness about the code — §4.4 is unusually precise about
+mechanism. It is that **each claim was written from the change that introduced it**,
+and stayed true only for the configuration that change was exercised in. The
+half-configured cases, and the cases a later change moved, are where all thirteen
+were found.
+
+[`CLAIMS.md`](CLAIMS.md) turns that into something checkable before the next design
+document is written.

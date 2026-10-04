@@ -18,7 +18,8 @@ and what is *not* verified.
 | [`DESIGN_PHASE1.md`](DESIGN_PHASE1.md) | The Phase 1 design — a delta over Phase 0, not a replacement: KEDA scaling on consumer lag, scale-to-zero, the three cluster findings that shaped it, the §16 gaps (A: rebalance floor, B: ephemeral session state, C: idle replay), §3.2 on supporting a local Kind cluster, and §21 designing agent **groups** — batch fan-out with a tracked fan-in, its own page and exactly two notifications. |
 | [`IMPLEMENTATION_REPORT1.md`](IMPLEMENTATION_REPORT1.md) | What Phase 1 built, the measured results on both clusters, 28 findings including two real bugs only a scale-to-zero deployment could expose, and an honest account of what is still blocked and why. |
 | [`README_PHASE1.md`](README_PHASE1.md) | The Phase 1 runbook in full detail, covering all four ways to run it: locally without containers, under Docker, on a Kind cluster, and on OpenShift. |
-| [`DESIGN_PHASE2.md`](DESIGN_PHASE2.md) | The Phase 2 design — identity on the event path. Why GitHub's opaque user token rules out local verification and forces a `GET /user` lookup plus a load-bearing cache; why `401` and `403` are kept distinct; what `ce_submitter` is and is not worth, and what a signature over it does and does not prove; how the `kid` and the approved-key set prove *which agent* answered, why group events are pinned to EventBridge's own key, and why a rejected response is stored as an error rather than dropped. |
+| [`DESIGN_PHASE2.md`](DESIGN_PHASE2.md) | The Phase 2 design — identity on the event path. Why GitHub's opaque user token rules out local verification and forces a `GET /user` lookup plus a load-bearing cache; why `401` and `403` are kept distinct; what `ce_submitter` is and is not worth, and what a signature over it does and does not prove; how the `kid` and the approved-key set prove *which agent* answered, why group events are pinned to EventBridge's own key, and why a rejected response is stored as an error rather than dropped. **§8 records the thirteen claims across §§2.6, 3, 4.3 and 4.4 that a docs review found do not hold in the code, with the issue filed for each.** |
+| [`CLAIMS.md`](CLAIMS.md) | How to check a control claim before it ships: the five questions (which code path, what default, what happens half-configured, can an attacker choose the input the check reads, what does it become one release from now), why reading the code and a passing test suite were both insufficient, and the shape of a correction that keeps the original reasoning. Written from the thirteen findings in `DESIGN_PHASE2.md` §8. |
 | [`DESIGN_PHASE3.md`](DESIGN_PHASE3.md) | The Phase 3 design — per-user isolation, declarative agents, and event triggers. Why a raw `submitter` cannot be a tenancy key and why the derived `userkey` ends in a hash; per-user Kafka topics (`{prefix}-{userkey}-requests`), one EventRunner Deployment and ScaledObject per user, and the honest difference between separately-named topics and ACL-enforced isolation; why a per-user ntfy topic must *not* contain the user's name, and the option of running ntfy as a service in the cluster; the `AgentSpec` — an agent baked into the image or assembled from skills fetched from GitHub, S3 or a URL, and the five gates a fetched bundle passes; authenticating and scoping the session transcript; and a Knative-inspired trigger API with the four loop controls that keep an event-driven agent system from becoming a cost incident. **Design only — not implemented.** |
 
 ## Reading order
@@ -33,8 +34,12 @@ and what is *not* verified.
   the opaque-token constraint is what rules out the design most people reach for.
 - **Debugging something odd?** [`IMPLEMENTATION_REPORT1.md`](IMPLEMENTATION_REPORT1.md)
   §4 — most surprises are already recorded there with their cause.
+- **Writing a claim about a control?** [`CLAIMS.md`](CLAIMS.md) first, then
+  [`DESIGN_PHASE2.md`](DESIGN_PHASE2.md) §8 for what thirteen such claims in this
+  repository got wrong and how.
 - **Presenting it?** [`DESIGN_PHASE2.md`](DESIGN_PHASE2.md) §2.6 and §3, for what the
-  identity controls do *not* prove.
+  identity controls do *not* prove — and §8, because four of them promise more than
+  the code delivers.
 - **Working on multi-tenancy, agent definitions or triggers?**
   [`DESIGN_PHASE3.md`](DESIGN_PHASE3.md) — §9 for the rollout order (the first four steps are
   refactors; everything risky is behind a flag that defaults off), §3.6 for what isolation does
