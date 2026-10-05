@@ -254,6 +254,20 @@ class Handlers:
         if groupid and not GROUP_REGEX.match(str(groupid)):
             return _json(start_response, "400 Bad Request", {"error": "bad groupid"})
 
+        # EVERY refusal happens before the first write. `_agent_for` can reject, and
+        # validating after the session and prompt rows are committed leaves a transcript
+        # page showing a turn that was never submitted — plus a correlation id claimed in
+        # the ownership index that nothing ever un-claims, since tombstoning is for
+        # deletion rather than for abandonment. That is the same orphan-write shape as the
+        # `/continue` 500 fixed in 7590ec8, reached by a route that fix did not cover.
+        #
+        # It depends only on `caller` and `body`, so there is nothing to gain by deferring
+        # it: resolve first, mint and write second.
+        try:
+            agent = self._agent_for(caller, body)
+        except _BadRequest as e:
+            return _json(start_response, "400 Bad Request", {"error": str(e)})
+
         corr = mint_for(self.minter, caller.userkey)
         sess = ce.session_uuid(corr)
         workdir = str(pathlib.Path(self.cfg.tmpdir) / "eventrunner" / "work" / corr)
@@ -267,10 +281,6 @@ class Handlers:
             # Membership before publication: the reverse order leaves a window where a
             # fast agent's terminal event arrives for a member nobody has recorded.
             store.add_group_member(groupid, corr)
-        try:
-            agent = self._agent_for(caller, body)
-        except _BadRequest as e:
-            return _json(start_response, "400 Bad Request", {"error": str(e)})
         event_id = self.producer.publish_request(
             prompt=prompt, correlationid=corr, sessionuuid=sess,
             mode="start", model=model, max_turns=max_turns, subject="start",
@@ -317,6 +327,18 @@ class Handlers:
                          {"error": f"expected={expected} contradicts {len(prompts)} prompts"})
 
         idem = environ.get("HTTP_IDEMPOTENCY_KEY") or None
+
+        # Before `groups.create`, which commits the group row AND publishes
+        # `group.started`. A `400` after that leaves a group with no members that can
+        # never gain any — and because the row is keyed on the Idempotency-Key, every
+        # retry reads back `created: false, members: []`, which looks like success. That
+        # is verbatim the failure the `userkey=` comment below describes, reached through
+        # a different route: the state is permanent precisely because the key worked.
+        try:
+            agent = self._agent_for(caller, body)
+        except _BadRequest as e:
+            return _json(start_response, "400 Bad Request", {"error": str(e)})
+
         groupid, created = self.groups.create(
             label=body.get("label"),
             expected=int(expected) if expected else (len(prompts) or None),
@@ -340,10 +362,6 @@ class Handlers:
                 "members": [m["correlationid"] for m in snap.get("members") or []],
                 "html_url": f"{self.cfg.public_base_url}/v0/groups/{groupid}",
             })
-        try:
-            agent = self._agent_for(caller, body)
-        except _BadRequest as e:
-            return _json(start_response, "400 Bad Request", {"error": str(e)})
         corrs = self.groups.submit_members(
             groupid, [str(x) for x in prompts],
             max_turns=int(body.get("max_turns", 3)), model=body.get("model"),

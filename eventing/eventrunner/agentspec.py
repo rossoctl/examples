@@ -80,6 +80,17 @@ class Skill:
 
 @dataclass(frozen=True)
 class Limits:
+    """Per-run ceilings from `[limits]`.
+
+    **Carried, not yet enforced** — the same arrangement as `Skill.sha256`: parsed and
+    validated here so a spec written today stays valid, and applied when the code that
+    applies it lands. `max_events` is T14's (§5.6's emit socket). `timeout_s` and
+    `max_output_bytes` need a wrapper around `run_agent`'s `Popen` and have none, so a
+    spec that sets them loads clean and bounds nothing.
+
+    Said plainly because the alternative is an operator writing `timeout_s = 900`,
+    getting no error, and believing there is a deadline.
+    """
     timeout_s: float = 0.0            # 0 = no spec-imposed deadline
     max_output_bytes: int = 0         # 0 = unbounded by the spec
     max_events: int = 2000            # §5.6 response events per run
@@ -233,11 +244,21 @@ def parse(raw: str, *, name: str, base_dir: pathlib.Path | None = None) -> Agent
                             sig_kid=str(entry.get("sig_kid", "")).strip()))
 
     lim = d.get("limits", {}) or {}
-    limits = Limits(
-        timeout_s=float(lim.get("timeout_s", 0.0)),
-        max_output_bytes=int(lim.get("max_output_bytes", 0)),
-        max_events=int(lim.get("max_events", Limits.max_events)),
-    )
+    if not isinstance(lim, dict):
+        raise SpecError(f"agent {name!r}: limits must be a table")
+    # Wrapped for the same reason `max_turns` is, 50 lines up: these three conversions
+    # raise ValueError/TypeError, and `run_agent` catches only `SpecError` — so
+    # `timeout_s = "900s"` propagated out of `run_agent` instead of becoming the
+    # `phase=error` event §5.1 promises. This block was the one place in `parse` that
+    # escaped the module's own contract.
+    try:
+        limits = Limits(
+            timeout_s=float(lim.get("timeout_s", 0.0)),
+            max_output_bytes=int(lim.get("max_output_bytes", 0)),
+            max_events=int(lim.get("max_events", Limits.max_events)),
+        )
+    except (TypeError, ValueError) as e:
+        raise SpecError(f"agent {name!r}: limits must be numbers: {e}") from None
 
     return AgentSpec(
         name=name,

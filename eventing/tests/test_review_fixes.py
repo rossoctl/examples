@@ -123,6 +123,45 @@ def test_the_index_is_seeded_from_an_existing_store(tmp_path):
         "a live correlation is still reported free, so Minter can reissue it"
 
 
+def test_a_seeded_scope_is_not_seeded_again(tmp_path):
+    """Round 2. §6.1a claims the backfill is one-time; the first implementation re-opened
+    every tenant store and re-scanned `all_correlations` on EVERY boot — the per-start
+    N-store seeding §2.6 rejects, reintroduced by the fix for the missing seed.
+
+    `needs_seeding` is what lets `__main__` skip the store open entirely. Measured effect
+    at 100 tenants x 200 correlations: 210 ms -> 0.8 ms per restart, 101 store opens -> 1.
+    """
+    owners = OwnerIndex(tmp_path / "eventbridge")
+    assert owners.needs_seeding()
+    owners.seed_from(["brave-otter-0001"])
+    assert not owners.needs_seeding(), "the shared scope was not marked seeded"
+
+
+def test_seed_scopes_are_tracked_independently(tmp_path):
+    """A seeded tenant must not mark another, or a new tenant's existing ids would stay
+    invisible to the uniqueness check."""
+    owners = OwnerIndex(tmp_path / "eventbridge")
+    owners.seed_from(["brave-otter-0001"], UK)
+    assert not owners.needs_seeding(UK)
+    assert owners.needs_seeding(OTHER)
+    assert owners.needs_seeding()          # the shared scope is its own
+
+
+def test_an_empty_store_is_still_marked_seeded(tmp_path):
+    """Otherwise it is re-opened and re-scanned on every boot forever."""
+    owners = OwnerIndex(tmp_path / "eventbridge")
+    assert owners.seed_from([]) == 0
+    assert not owners.needs_seeding()
+
+
+def test_the_seed_mark_survives_a_restart(tmp_path):
+    root = tmp_path / "eventbridge"
+    one = OwnerIndex(root)
+    one.seed_from(["brave-otter-0001"], UK)
+    one.close()
+    assert not OwnerIndex(root).needs_seeding(UK)
+
+
 def test_seeding_is_idempotent_across_restarts(tmp_path):
     root = tmp_path / "eventbridge"
     store = Store(root)
@@ -375,12 +414,51 @@ def test_a_shared_tier_correlation_is_still_readable(tmp_path):
                                  "x" * 64])
 def test_a_bad_agent_name_is_400_not_an_async_error_event(tmp_path, bad):
     """`202 Accepted` followed minutes later by a `phase=error` event the submitter may
-    never look at is the wrong answer to a typo in the call that made it."""
-    h, producer, _, _ = _api(tmp_path)
+    never look at is the wrong answer to a typo in the call that made it.
+
+    **And a `400` must write nothing** — the same property
+    `test_a_shared_tier_continue_is_refused_not_a_500` pins for `/continue`, which this
+    test originally failed to assert 25 lines away. Round 1 added the validation but put
+    it AFTER the writes, so a `400` left a session row, a prompt row and a claimed
+    correlation id behind: a transcript page showing a turn that was never submitted,
+    plus an id nothing will ever un-claim, since tombstoning is for deletion rather than
+    abandonment.
+    """
+    h, producer, owners, stores = _api(tmp_path)
     sr = _Start()
     h.start_agent(_env({"prompt": "hi", "agent": bad}, token=_as(h, OWNER)), sr)
     assert sr.status.startswith("400"), sr.status
     producer.publish_request.assert_not_called()
+    assert stores.for_userkey(UK).all_correlations(limit=10) == [], \
+        "a refused submit committed a session row"
+    assert owners.count() == 0, "a refused submit claimed a correlation id"
+
+
+def test_a_bad_agent_name_on_create_group_writes_nothing(tmp_path):
+    """The same ordering bug on the group path, where the state becomes PERMANENT.
+
+    `groups.create` commits the group row and publishes `group.started`, so a `400` after
+    it left a group with no members that could never gain any — and because the row is
+    keyed on the Idempotency-Key, every retry read back `created: false, members: []`,
+    which looks like success. The retry is the point of this test.
+    """
+    h, producer, owners, stores = _api(tmp_path)
+    tok = _as(h, OWNER)
+    env = _env({"prompts": ["a", "b"], "agent": "../../etc"}, token=tok)
+    env["HTTP_IDEMPOTENCY_KEY"] = "retry-me"
+    sr = _Start()
+    h.create_group(env, sr)
+    assert sr.status.startswith("400"), sr.status
+    assert stores.for_userkey(UK).all_groups() == [], "a refused batch created a group"
+    assert owners.count() == 0, "a refused batch claimed a groupid"
+
+    # The retry, with the same key and a valid name, must actually launch the batch.
+    good = _env({"prompts": ["a", "b"], "agent": "triager"}, token=tok)
+    good["HTTP_IDEMPOTENCY_KEY"] = "retry-me"
+    sr2 = _Start()
+    out = json.loads(b"".join(h.create_group(good, sr2)))
+    assert sr2.status.startswith("202"), sr2.status
+    assert out["created"] is True and len(out["members"]) == 2
 
 
 def test_a_good_agent_name_still_rides(tmp_path):

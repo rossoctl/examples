@@ -30,7 +30,14 @@ first attempt**, and §4.1 is about why.
 | T13 | `eventrunner/agentspec.py` — declarative agent definitions | 290 |
 | T22 | `test_manifests.py` — the Secret-vs-ConfigMap rule, both directions | — |
 
-Ten commits, 40 files, **+5933/−173**. New configuration: `EB_TENANCY_MODE` (default
+**As of `3278d75`, the commit before this report:** ten commits, 40 files,
+**+5933/−173**. Counted from a named point rather than "currently", because a report that
+counts the branch it is committed on can never be right about its own diff — at
+`c25a0c77` the figures are 11 commits, 41 files, +6298/−173, the difference being this
+file and its index entry. A reader checking either number should get the one the text
+claims.
+
+New configuration: `EB_TENANCY_MODE` (default
 `single`), `EB_TOPIC_PREFIX`, `EB_USER_REGISTRY_PATH`, `EB_MAX_OPEN_STORES`, `ER_USERKEY`,
 `ER_AGENT_DIR`, `ER_AGENT_NAME`.
 
@@ -290,7 +297,79 @@ Generalisable: **a fake placed at the boundary you are testing cannot test that
 boundary.** The fakes were at `Producer`, and the bug was in what the handler passed to
 `Producer`.
 
-### 4.7 Smaller findings
+### 4.7 A fix that introduced a new bug class: validation after the writes
+
+**Found by:** review, round 2. **Fixed in:** this round.
+
+Round 1 added validation of the request's `agent` name at the HTTP boundary — the right
+place, for the right reason — and placed it **after** the writes in both submit paths. So
+a `400` left committed state behind:
+
+```
+POST /v0/groups {"prompts":["a","b"],"agent":"../../etc"}  Idempotency-Key: retry-me
+  -> 400 Bad Request
+  topics published: ['kev1-st-alice-c8ff0431-responses']      # group.started went out
+  groups in alice's store: ['wild-weasel-1995']               # 0 members, forever
+  retry, same key, valid name -> 200 {created: false, members: []}
+
+POST /v0/agents {"prompt":"hi","agent":"Not A Label"}
+  -> 400 Bad Request
+  sessions committed: ['fancy-puma-7571']                     # a turn never submitted
+  ownership index count: 1                                    # an id nothing un-claims
+```
+
+The group case is the worse of the two and the more interesting: the state is permanent
+*because the Idempotency-Key worked*. Every retry reads back the member-less row, which
+is verbatim the failure the `userkey=` comment added in the same round describes — reached
+through a route that fix did not cover.
+
+Three things make this worth its own section rather than a line in §4.9:
+
+- **It is the same orphan-write shape as §4.9's `/continue` 500**, which round 1 fixed.
+  Fixing an instance did not teach me to look for the class — the same lesson §4.2 records
+  about the eviction contract, learned again.
+- **The test for the new validation asserted the status and that nothing was published**,
+  both of which held. The assertion that would have caught it —
+  `get_prompts(corr) == []`, *a refusal writes nothing* — already existed 25 lines
+  earlier in the same file, on a different route.
+- **`test_topic_routing_e2e.py` did not catch it either**, because it asserts topics and
+  the `start_agent` case publishes nothing. A test aimed at one invariant does not
+  incidentally cover another.
+
+Both resolutions now happen before the first write; `_agent_for` needs only `caller` and
+`body`, so there was never anything to gain by deferring it.
+
+### 4.8 Three places the design still disagreed with the code
+
+**Found by:** review, round 2. **Fixed in:** this round. Grouped because the cause is one
+thing: §3 of this report claimed the design/code gap was closed, and checking it found
+three items it had missed.
+
+- **The backfill was per-start, not one-time.** §6.1a says "seeded once" and §2 of this
+  report said "once, on the first start after an upgrade"; the loop re-opened every tenant
+  store and re-read `all_correlations` on every boot. `seed_from` is `INSERT OR IGNORE` so
+  correctness held — what repeated was exactly the cost §2.6's argument is about. Measured
+  at 100 tenants × 200 correlations: **210 ms per restart, 101 store opens**, and at
+  §2.6's own worked example (100 × 10,000) it extrapolates to ~6 s on every boot. A
+  `seed_state` table now records each scope, so an already-seeded store is never opened:
+  **0.8 ms and 1 store open** per restart. The claim is now true.
+- **`AgentSpec.limits` was parsed and enforced nowhere, silently.** `Skill` states plainly
+  that it carries `sha256` for T19; `Limits` made no such disclaimer, so `timeout_s = 900`
+  loaded clean and did nothing. Now says so. Its three conversions also escaped the
+  module's `SpecError` contract — `timeout_s = "900s"` raised a bare `ValueError` past
+  `run_agent`'s handler instead of becoming the `phase=error` event §5.1 promises.
+- **§8.3 was not updated with §2.6.** It still said the signed set "changes twice" and
+  named two attributes while §2.6, `signing.py` and `ce.py` all said three — and
+  `signing.py` cited §8.3 as the authority for a rule §8.3 stated over the wrong count.
+
+Two smaller ones from the same pass: a tombstoned correlation could be re-claimed by the
+NULL owner (`row[0] == userkey` reads as "already mine" when both are `NULL`),
+contradicting `forget`'s guarantee — unreachable from `Minter.mint`, which checks
+`exists()` first, but reachable as soon as a `correlationid` arrives from outside. And
+`registry.parse` accepted `agent` unchecked, the only field it did not validate, in a
+function whose docstring promises every inconsistency is a refusal.
+
+### 4.9 Smaller findings
 
 - **`/continue` 500 on an unresolvable owner** (`7590ec8`), and again on a *known but
   unowned* correlation (`6ebdd80`). The second taught something: reading and publishing

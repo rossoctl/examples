@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS correlation_owner (
   deleted_utc   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_owner_userkey ON correlation_owner(userkey);
+
+-- Which stores have already been seeded (`seed_from`). Without this the startup backfill
+-- re-opens every tenant store and re-reads `all_correlations` on EVERY boot, which is the
+-- per-start N-store seeding §2.6 rejects — reintroduced by the fix for the missing seed.
+-- Sound because nothing can add an UNINDEXED id to a store after it is seeded: every mint
+-- claims as it mints, so a seeded store cannot later acquire one.
+CREATE TABLE IF NOT EXISTS seed_state (
+  scope     TEXT PRIMARY KEY,   -- "" for the shared/single store, else the userkey
+  done_utc  TEXT NOT NULL
+);
 """
 
 
@@ -126,10 +136,24 @@ class OwnerIndex:
                 (correlationid, userkey))
             if cur.rowcount:
                 return
-            # The row already existed. Same owner is idempotent; anything else is a clash.
+            # The row already existed. Same owner is idempotent; anything else is a
+            # clash. A TOMBSTONE is never a re-claim, whoever asks: `forget` clears
+            # `userkey` to NULL, so for `claim(corr, None)` the `row[0] == userkey` test
+            # below would read as "already mine" and succeed — contradicting the
+            # guarantee `forget` makes, that the id is reserved forever because a reissue
+            # derives the same unsalted `sessionuuid`.
+            #
+            # Not reachable from `Minter.mint`, which checks `exists()` first and a
+            # tombstone is `True`. It becomes reachable the moment a `correlationid`
+            # arrives from outside — which §7's triggers and T6/T7 plausibly bring — so it
+            # is closed here, where the invariant is written down.
             row = self._c.execute(
-                "SELECT userkey FROM correlation_owner WHERE correlationid=?",
+                "SELECT userkey, deleted_utc FROM correlation_owner WHERE correlationid=?",
                 (correlationid,)).fetchone()
+            if row is not None and row[1]:
+                raise Collision(
+                    f"correlation {correlationid!r} is tombstoned and can never be "
+                    f"reissued; a reissue would derive the same sessionuuid")
             if row is not None and row[0] == userkey:
                 return
             raise Collision(
@@ -146,6 +170,25 @@ class OwnerIndex:
         return self._c.execute(
             "SELECT 1 FROM correlation_owner WHERE correlationid=? LIMIT 1",
             (correlationid,)).fetchone() is not None
+
+    def needs_seeding(self, userkey: str | None = None) -> bool:
+        """Whether this store's ids still have to be backfilled.
+
+        Lets the caller skip the `Store` open and the `all_correlations` query entirely,
+        which is the whole cost §2.6 objects to. `seed_from` is `INSERT OR IGNORE` so
+        repeating it was harmless to *correctness* — what repeated was two SQLite
+        connections and an indexed scan per tenant before the socket binds, on every boot.
+        """
+        return self._c.execute(
+            "SELECT 1 FROM seed_state WHERE scope=? LIMIT 1",
+            (userkey or "",)).fetchone() is None
+
+    def mark_seeded(self, userkey: str | None = None) -> None:
+        """Record that this store has been backfilled. Idempotent."""
+        with self._lock:
+            self._c.execute(
+                "INSERT OR REPLACE INTO seed_state(scope,done_utc) "
+                "VALUES (?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", (userkey or "",))
 
     def seed_from(self, correlationids, userkey: str | None = None) -> int:
         """Record ids that already exist outside the index. Returns how many were new.
@@ -165,6 +208,10 @@ class OwnerIndex:
         without this, Phase 3 is a regression in the DEFAULT configuration, which is the
         one thing the phase promises cannot happen.
 
+        Marks the scope seeded on completion, so `needs_seeding` returns `False`
+        afterwards and the caller can skip the store open next boot. Callers that bypass
+        `needs_seeding` still get a correct (if wasted) re-seed.
+
         `INSERT OR IGNORE`, so re-seeding is free and a correlation already claimed by a
         tenant keeps its owner. Seeding assigns `userkey=None` for ids recovered from a
         single-tenant store, which is the correct owner for them: they predate tenancy.
@@ -178,6 +225,9 @@ class OwnerIndex:
                     "VALUES (?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                     (corr, userkey))
                 new += cur.rowcount or 0
+            self._c.execute(
+                "INSERT OR REPLACE INTO seed_state(scope,done_utc) "
+                "VALUES (?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", (userkey or "",))
         return new
 
     # ---- owner-scoped reads (§6.2) -----------------------------------------

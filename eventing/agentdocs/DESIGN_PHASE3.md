@@ -2053,14 +2053,23 @@ upgrades and changes nothing behaves exactly as it did in Phase 2.
 
 ### 8.3 Two notes that are not table rows
 
-**The signed-attribute set changes twice, and both changes must land together.**
-`userkey` (§2.6) and `depth` (§7.7) both join `signing.SIGNED_ATTRS`. Phase 2 §4.2
-already set the precedent and the rule: adding an attribute changes canonicalisation, so
-a signer and a verifier on different versions disagree about every signature. Doing it
-in two commits would invalidate canonicalisation twice for no benefit, so it is **one
-change**, and deployments with signing already enabled must upgrade both services
-together. Deployments with signing off (the default) are unaffected, which is most of
-them.
+**The signed-attribute set changes once, for three attributes, and that change must
+land in one commit.** `userkey` (§2.6), `depth` (§7.7) and `agent` (§5.1) all join
+`signing.SIGNED_ATTRS`. Phase 2 §4.2 already set the precedent and the rule: adding an
+attribute changes canonicalisation, so a signer and a verifier on different versions
+disagree about every signature. Doing it in three commits would invalidate
+canonicalisation three times for no benefit, so it is **one change**, and deployments
+with signing already enabled must upgrade both services together. Deployments with
+signing off (the default) are unaffected, which is most of them.
+
+An earlier revision of this paragraph said "changes twice" and named only `userkey` and
+`depth`. `agent` belongs in the set for the same reason as the other two and arguably
+more urgently: it selects the `AgentSpec` that supplies `--permission-mode` and the tool
+allowlists, which §5.1 calls "the sandbox". Outside the signed set, anything with write
+access to a requests topic could rewrite `ce_agent` to name a spec with a wider policy
+and **the signature would still verify** — making a signed deployment worse than an
+unsigned one, because an operator believes it is attested. §2.6 has the full list of what
+rides on the event and which three are signed.
 
 **Secret-vs-ConfigMap, continuing Phase 2 §5's rule.** Seed and HMAC-secret paths
 (`EB_NTFY_TOPIC_SECRET_PATH`, `EB_CAPABILITY_SECRET_PATH`, `EB_WEBHOOK_SECRETS_PATH`)

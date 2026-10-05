@@ -183,6 +183,14 @@ the full list of what stays open: `agentdocs/README_PHASE1.md` §
 "Submit-path authentication".
 
 Two of these are load-bearing in ways that are easy to miss.
+`ER_EVENTBRIDGE_URL` is what makes `/continue` survive a scale-to-zero *and* what
+keeps event `sequence` numbers unique across pods — without it a second pod
+restarts numbering at 1 and its rows overwrite the first turn's.
+`ER_CONSUMER_GROUP` must match the ScaledObject exactly or KEDA measures a group
+nobody joins.
+
+#### Phase 3 — per-user isolation
+
 Added in Phase 3 (`agentdocs/DESIGN_PHASE3.md`). Only the variables whose code is
 actually in the tree — §9's steps 1–4. Every one of them is off or single-tenant by
 default, so an existing deployment that upgrades and changes nothing behaves exactly
@@ -198,22 +206,24 @@ as it did:
 | `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2) |
 | `ER_AGENT_NAME` | `default` | Fallback agent when neither the request nor the registry names one. `default` with no file on disk is Phase 2's argv exactly |
 
-Two notes on these. **`multi` mode is not yet isolation you should present as such.**
+Three notes on these. **`multi` mode is not yet isolation you should present as
+such.**
 Per-user stores *are* implemented (T5), so each tenant's sessions, responses and
 transcripts live in their own SQLite files and a read routes to the owning tenant's store
 — but nothing yet checks that the *caller* is that owner, because owner-scoped reads (T7)
 and transcript authentication (T8) are not in. So in `multi` mode the HTTP reads,
-`/continue` and `PUT /transcript` are still as open as Phase 2's. And even once they land, separate topics without Kafka ACLs are
-*organisation*, not isolation; `DESIGN_PHASE3.md` §3.6 and §10 are explicit about which
-claim each configuration earns. **Adding a user is an operator action**: EventBridge has
-no Kubernetes client and will not create topics, so a registry entry whose topics do not
-exist is a refusal, not an auto-provision.
+`/continue` and `PUT /transcript` are still as open as Phase 2's. And even once they
+land, separate topics without Kafka ACLs are *organisation*, not isolation;
+`DESIGN_PHASE3.md` §3.6 and §10 are explicit about which claim each configuration earns.
 
-`ER_EVENTBRIDGE_URL` is what makes `/continue` survive a scale-to-zero *and* what
-keeps event `sequence` numbers unique across pods — without it a second pod
-restarts numbering at 1 and its rows overwrite the first turn's.
-`ER_CONSUMER_GROUP` must match the ScaledObject exactly or KEDA measures a group
-nobody joins.
+**`multi` also does not work end to end yet.** Until T6 neither consumer subscribes to
+the per-user topics, so no response is ever consumed: transcript pages stay empty, group
+counters never advance, and nothing is logged. Treat it as something to develop against,
+not to run.
+
+**Adding a user is an operator action.** EventBridge has no Kubernetes client and will
+not create topics, so a registry entry whose topics do not exist is a refusal, not an
+auto-provision.
 
 EventRunner does **not** hand its whole environment to the child process. It
 forwards a curated set — `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,

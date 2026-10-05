@@ -139,12 +139,26 @@ def main() -> int:
     # Cheap after the first run: `INSERT OR IGNORE` over ids the index already holds, and
     # `all_correlations` is one indexed query per store. The `limit` matches the 10,000
     # Phase 2 applied to its own seed.
-    seeded = owners.seed_from(store.all_correlations(limit=10000))
+    # `needs_seeding` is checked FIRST so an already-seeded store is never opened and
+    # never scanned. Without that gate this loop is the per-start N-store seeding §2.6
+    # rejects: `seed_from` is `INSERT OR IGNORE` so repeating it is harmless to
+    # correctness, but the cost §2.6's whole argument is about — two SQLite connections
+    # and an indexed scan per tenant, before the socket binds — was being paid on every
+    # boot. Measured at ~210 ms per restart for 100 tenants x 200 correlations, and §2.6's
+    # own worked example (100 x 10,000) extrapolates to ~6 s added to every restart.
+    #
+    # Skipping is sound because nothing can add an UNINDEXED id to a store after it is
+    # seeded: every mint claims as it mints, so a seeded store cannot later acquire one.
+    seeded = 0
+    if owners.needs_seeding():
+        seeded += owners.seed_from(store.all_correlations(limit=10000))
     if topics.multi:
         # Every tenant's store too, otherwise a tenant's existing ids stay invisible to
         # the uniqueness check. `known_userkeys` reads the filesystem rather than the LRU,
         # so a tenant that is merely closed is still seeded.
         for uk in stores.known_userkeys():
+            if not owners.needs_seeding(uk):
+                continue
             seeded += owners.seed_from(
                 stores.for_userkey(uk).all_correlations(limit=10000), uk)
     if seeded:

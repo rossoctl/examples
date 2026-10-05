@@ -196,8 +196,24 @@ def parse(raw: str) -> Registry:
         except (TypeError, ValueError) as exc:
             raise RegistryError(f"{where}: limits must be integers") from exc
 
+        agent = str(e.get("agent", "")).strip()
+        if agent:
+            # The same gate the HTTP boundary applies (`handlers._agent_for`), and the
+            # last field in this function that was accepted unchecked — against a
+            # docstring promising "every inconsistency is a refusal". A startup refusal
+            # rather than a 400, because this value reaches `ce_agent` via
+            # `by_userkey(...).agent` on a path that never sees `validate_name`: the
+            # runner then rejects it, so a registry typo would mean an asynchronous
+            # `phase=error` on EVERY request from that user — the failure mode the
+            # request path was moved away from.
+            from eventrunner import agentspec
+            try:
+                agentspec.validate_name(agent)
+            except agentspec.SpecError as exc:
+                raise RegistryError(f"{where} ({issuer}/{userid}): {exc}") from None
+
         users.append(User(issuer=issuer, userid=userid, userkey=computed, tier=tier,
-                          agent=str(e.get("agent", "")).strip(), limits=limits))
+                          agent=agent, limits=limits))
 
     return Registry(users=tuple(users))
 
