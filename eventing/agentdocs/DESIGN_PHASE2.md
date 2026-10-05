@@ -458,6 +458,13 @@ document for a reader who cannot see the code. Six review rounds then checked ea
 restated claim **by running it**, against `eventing/` at `d9677ddd`. Thirteen did
 not hold.
 
+The tally, because a count that cannot be checked is the same failure this section is
+about: **five in §8.1** (four table rows plus the fifth, promised nowhere), **four in
+§8.2**, **four in §8.3**. An earlier revision stated thirteen while enumerating eleven,
+because two bullets each carried two findings in one paragraph — §8.2's capability-URL
+entry covered the group list and the member list, and §8.3's SPIRE entry covered the
+algorithm and the file format. They are split now, so the list reads 13.
+
 They are recorded here rather than edited into §3 and §4.4 in place, so the reasoning
 above stays readable as the record of what was intended, and this section says what
 the code does. That convention is this repository's own: where a later phase supersedes
@@ -469,7 +476,7 @@ deletes the original intent loses the more useful half.
 | §4.4 says | The code does | Issue |
 |---|---|---|
 | "A keyset alone verifies **and logs**" | Verifies and returns a verdict. Nothing is logged or counted, so the observable reject rate the two-flag rollout depends on does not exist. | [#886](https://github.com/rossoctl/examples/issues/886) |
-| The verifier accepts "**only**" EventBridge's kid for group events, so an approved runner "cannot forge a `group.completed` and end a batch early" | Flags it, then applies it anyway. `kafka_in.py` rewrites `phase`/`data` but keeps `final` and `groupid`, so the rewritten event still reaches `on_group_event`. The group mirror replays group events unverified on restart. | [#885](https://github.com/rossoctl/examples/issues/885) |
+| The verifier accepts "**only**" EventBridge's kid for group events, so an approved runner "cannot forge a `group.completed` and end a batch early" | Flags it, then applies it anyway. `kafka_in.py` routes on `ce.is_group_event(evt)` — the *original* event, independently of the rewrite — and the rewrite replaces only `phase`/`data`, so `type` and `groupid` survive and `on_group_event` ends the batch. The group mirror replays group events unverified on restart. | [#885](https://github.com/rossoctl/examples/issues/885) |
 | Step 2: "this proves *who finished a run*" | Not once stored. `insert_response` uses `INSERT OR REPLACE` on `(correlationid, sequence)`, so a later **unsigned** frame reusing a sequence number replaces the verified terminal row. | [#885](https://github.com/rossoctl/examples/issues/885) |
 | "EventBridge refuses to start with a keyset but no `EB_SIGNING_KID`" | True — but nothing checks that the kid is *in* the keyset. EventBridge starts, then flags its own group events. | [#888](https://github.com/rossoctl/examples/issues/888) |
 
@@ -486,10 +493,12 @@ opposite directions, and only one of them is loud.**
 
 ### 8.2 §3's "deliberately left open" is wider than stated
 
-- **§3.1's capability-URL argument rests on ids being unguessable.** `GET /v0/groups`
-  returns the 100 most recent groups without sign-in, and `GET /v0/groups/{id}/status`
-  lists every member's correlation id. For any conversation in a group, the capability
-  is published. ([#887](https://github.com/rossoctl/examples/issues/887))
+- **§3.1's capability-URL argument rests on ids being unguessable, and the group list
+  publishes them.** `GET /v0/groups` returns the 100 most recent groups without sign-in.
+  ([#887](https://github.com/rossoctl/examples/issues/887))
+- **The member list publishes them too.** `GET /v0/groups/{id}/status` lists every
+  member's correlation id, so for any conversation in a group the capability is published
+  rather than merely guessable. ([#887](https://github.com/rossoctl/examples/issues/887))
 - **§3.2 understates what `PUT /transcript` allows.** It is the checkpoint EventRunner
   **resumes from** on a cold pod, so an unauthenticated write changes what the agent
   continues with. Request signing does not cover it.
@@ -499,16 +508,28 @@ opposite directions, and only one of them is loud.**
   non-terminal frame without it is pushed, stored in the member's transcript and shown
   on the group page; a forged terminal without it is pushed at priority 5 even with
   `NTFY_GROUP_NOTIFY_ERRORS` off, and does not count the member as failed.
+  ([#891](https://github.com/rossoctl/examples/issues/891)) — §8.5.4 is the general rule
+  this is an instance of, and the fix is to decide on group membership from the store
+  rather than on the groupid the frame supplies.
 
-### 8.3 Three things about the keys
+### 8.3 Four things about the keys
+
+**No issue links in this subsection, deliberately.** §8.1 and §8.2 record code bugs and
+every item carries the issue filed for it. These four are **documentation drift** — claims
+this document made that the code never matched, or stopped matching — so the correction
+*is* the fix and there is nothing to track. §8.7 says to file the issue; it is worth
+saying out loud where that does not apply, since an unlinked finding otherwise reads as
+an oversight.
+
 
 - **§2.6 records `submitter`/`submitteriss` as unsigned.** They joined `SIGNED_ATTRS`
   in §4.2, so the signature covers them. The limit that remains is a different one and
   worth stating as such: a signature proves EventBridge *asserted* the name.
-- **§4.3's "the verification code does not change" under SPIRE does not hold.** The
-  verifier accepts EdDSA only, and SPIRE issues EC or RSA keys. The keyset is also a
-  flat JSON map of kid to key, and `keyset.load` rejects a JWKS document outright. The
-  kid lookup survives; the algorithm and the file format do not.
+- **§4.3's "the verification code does not change" under SPIRE does not hold, on
+  algorithm.** The verifier accepts EdDSA only, and SPIRE issues EC or RSA keys.
+- **Nor on file format.** The keyset is a flat JSON map of kid to key, and `keyset.load`
+  rejects a JWKS document outright. The kid lookup survives; the algorithm and the file
+  format do not.
 - **A flat keyset makes the asymmetric keys attribution, not restriction.** §4.4 step 5
   says a flat keyset "is not enough" for group events, and pins them. The same
   reasoning applies to member answers and is not drawn: EventBridge's own key is in
