@@ -442,3 +442,220 @@ knowing before a demo.
 - **Finishing agent identity?** §4.2 for the blocker, then §4.4 in order.
 - **Presenting it?** §2.6 and §3 — what the controls do *not* prove. A security
   demo that oversells its guarantee is worse than one that does not exist.
+
+---
+
+## 8. What the docs review found (added after rossoctl/rossoctl#2609)
+
+**Scope.** §8.1–§8.4 are about **Phase 2** specifically: thirteen claims *this
+document* made about the identity and signing controls, which do not hold in the code.
+§8.5–§8.8 are the general procedure that came out of them, and apply to a claim made in
+any phase — Phase 3's design makes claims of the same shape about tenancy and the signed
+attribute set, and nothing here is Phase 2 only.
+
+Writing the user-facing pages for this path meant restating every claim in this
+document for a reader who cannot see the code. Six review rounds then checked each
+restated claim **by running it**, against `eventing/` at `d9677ddd`. Thirteen did
+not hold.
+
+They are recorded here rather than edited into §3 and §4.4 in place, so the reasoning
+above stays readable as the record of what was intended, and this section says what
+the code does. That convention is this repository's own: where a later phase supersedes
+an earlier one it says so explicitly rather than editing in place, and a correction that
+deletes the original intent loses the more useful half.
+
+### 8.1 Promises in §4.4 that the code does not keep
+
+| §4.4 says | The code does | Issue |
+|---|---|---|
+| "A keyset alone verifies **and logs**" | Verifies and returns a verdict. Nothing is logged or counted, so the observable reject rate the two-flag rollout depends on does not exist. | [#886](https://github.com/rossoctl/examples/issues/886) |
+| The verifier accepts "**only**" EventBridge's kid for group events, so an approved runner "cannot forge a `group.completed` and end a batch early" | Flags it, then applies it anyway. `kafka_in.py` rewrites `phase`/`data` but keeps `final` and `groupid`, so the rewritten event still reaches `on_group_event`. The group mirror replays group events unverified on restart. | [#885](https://github.com/rossoctl/examples/issues/885) |
+| Step 2: "this proves *who finished a run*" | Not once stored. `insert_response` uses `INSERT OR REPLACE` on `(correlationid, sequence)`, so a later **unsigned** frame reusing a sequence number replaces the verified terminal row. | [#885](https://github.com/rossoctl/examples/issues/885) |
+| "EventBridge refuses to start with a keyset but no `EB_SIGNING_KID`" | True — but nothing checks that the kid is *in* the keyset. EventBridge starts, then flags its own group events. | [#888](https://github.com/rossoctl/examples/issues/888) |
+
+A fifth, promised nowhere but worse than any of them:
+
+**`EB_REQUIRE_RESPONSE_SIGNATURE=true` with no keyset refuses nothing.** The decision
+is only reached when a keyset is loaded — `kafka_in.py` has `ok, why = True, "not
+checked"` behind `if self._keyset is not None` — so `require` is never consulted. A
+forged terminal response is stored as an answer, and the startup line says `response
+verification OFF`. The request side does the opposite: with `ER_REQUIRE_SIGNATURE=true`
+and no key at all, `verify_event` refuses every request. **The two sides fail in
+opposite directions, and only one of them is loud.**
+([#888](https://github.com/rossoctl/examples/issues/888))
+
+### 8.2 §3's "deliberately left open" is wider than stated
+
+- **§3.1's capability-URL argument rests on ids being unguessable.** `GET /v0/groups`
+  returns the 100 most recent groups without sign-in, and `GET /v0/groups/{id}/status`
+  lists every member's correlation id. For any conversation in a group, the capability
+  is published. ([#887](https://github.com/rossoctl/examples/issues/887))
+- **§3.2 understates what `PUT /transcript` allows.** It is the checkpoint EventRunner
+  **resumes from** on a cold pod, so an unauthenticated write changes what the agent
+  continues with. Request signing does not cover it.
+  ([#887](https://github.com/rossoctl/examples/issues/887))
+- **Group-member push suppression is defeated by omitting an attribute.** `ntfy.py`
+  decides on the *event's own* `ce_groupid`, not on group membership. A forged
+  non-terminal frame without it is pushed, stored in the member's transcript and shown
+  on the group page; a forged terminal without it is pushed at priority 5 even with
+  `NTFY_GROUP_NOTIFY_ERRORS` off, and does not count the member as failed.
+
+### 8.3 Three things about the keys
+
+- **§2.6 records `submitter`/`submitteriss` as unsigned.** They joined `SIGNED_ATTRS`
+  in §4.2, so the signature covers them. The limit that remains is a different one and
+  worth stating as such: a signature proves EventBridge *asserted* the name.
+- **§4.3's "the verification code does not change" under SPIRE does not hold.** The
+  verifier accepts EdDSA only, and SPIRE issues EC or RSA keys. The keyset is also a
+  flat JSON map of kid to key, and `keyset.load` rejects a JWKS document outright. The
+  kid lookup survives; the algorithm and the file format do not.
+- **A flat keyset makes the asymmetric keys attribution, not restriction.** §4.4 step 5
+  says a flat keyset "is not enough" for group events, and pins them. The same
+  reasoning applies to member answers and is not drawn: EventBridge's own key is in
+  `EB_VERIFY_KEYSET_PATH` by requirement, so it verifies on any run's answer, as does
+  any approved runner's key.
+
+### 8.4 Why this is worth the space
+
+Every item above is a claim this document made that a reader could have relied on. The
+pattern is not carelessness about the code — §4.4 is unusually precise about
+mechanism. It is that **each claim was written from the change that introduced it**,
+and stayed true only for the configuration that change was exercised in. The
+half-configured cases, and the cases a later change moved, are where all thirteen
+were found.
+
+The rest of this section turns that into something checkable before the next design
+document is written.
+
+### 8.5 Checking a control claim before it ships
+
+§8.1–§8.4 are what thirteen unchecked claims cost. What follows is the procedure that
+came out of them: five questions to ask of any sentence that says a security control
+does something, how to check it cheaply, and what a correction should preserve.
+
+**It is not specific to Phase 2.** The findings above are — they are claims this
+document made — but the questions apply to any phase, and Phase 3's design makes
+claims of exactly the same shape about tenancy and the signed attribute set. It lives
+here because this is the phase whose review produced it, and because a procedure
+filed away from the findings that motivated it is a procedure nobody reads.
+
+#### The five questions
+
+Ask these of every sentence that says a control does something. A claim that cannot
+answer all five is not ready to publish.
+
+#### 8.5.1 Which code path, by name?
+
+Name the function or module the claim rests on, and read it. Not the change that
+introduced it — the code as it stands.
+
+> "Group events are pinned to EventBridge's kid" rested on `verify_with_keyset`'s
+> `expect_kid`, which does refuse a wrong kid. The claim was about **the batch not
+> ending**, and that depends on `kafka_in.py` and `group_service.py`, which no one
+> re-read. The verdict was correct and ignored.
+
+A claim about an *outcome* has to follow the path to that outcome, not stop at the
+check.
+
+#### 8.5.2 What is the default?
+
+State it. Most controls here default to off, and a claim that reads as a description
+of the system is a claim about a configuration almost nobody runs.
+
+#### 8.5.3 What happens when it is half-configured?
+
+Every control here has more than one variable. For each combination where one is
+missing, does the system fail **closed**, fail **open**, or refuse to start?
+
+This is where the worst finding came from. `EB_REQUIRE_RESPONSE_SIGNATURE=true` with
+no keyset refuses nothing, silently, while the equivalent on the request side refuses
+everything. Both were documented as "refusal is on"; only one was true.
+
+Tabulate it. A control with two variables has four cases, and the three that are not
+"both set" are the ones a reader will hit.
+
+#### 8.5.4 Can an attacker choose the input the check reads?
+
+If the decision reads an attribute off the event, the forger controls that attribute
+— including by leaving it out.
+
+> Group-member push suppression reads the event's own `ce_groupid`. A forged frame
+> that omits it is not a group member as far as that check is concerned, so it is
+> pushed.
+
+Prefer deciding on state the attacker does not supply: group membership from the
+store, not the groupid on the frame.
+
+#### 8.5.5 What does the claim become one release from now?
+
+If the claim depends on an open bug, it expires when the bug is fixed. Add a comment
+naming the release and the issue, per the docs contributor guide's accuracy rule 2:
+
+```markdown
+<!-- VERIFY v0.9.0: drop "nothing records the failure" once rossoctl/examples#886 lands. -->
+```
+
+Say what should change, not just that something will. A maintainer acting on a vague
+comment deletes the wrong sentence — and check whether the claim is *still partly
+true* afterwards. "Anything that can write to the responses topic can end a batch"
+survives the fix for #885 whenever enforcement is off, which is the default.
+
+### 8.6 Run it — reading the code is not enough
+
+Reading the code is not enough, and neither is the test suite: every one of the
+thirteen coexisted with a passing suite, because the tests exercised the
+configuration the claim was true in.
+
+The cheap version is enough. For `eventing/`, a venv and a few lines driving the real
+function beat a cluster:
+
+```bash
+cd eventing && python3 -m venv .venv && .venv/bin/pip install -q -e .
+.venv/bin/python - <<'PY'
+from shared import signing, keyset, ce
+# ... build the event, call the real decision function, print the verdict
+PY
+```
+
+Three rules for the harness:
+
+- **Call the real function.** A reimplementation of the guard proves nothing about the
+  guard. Where the real call site is awkward, copy its shape and cite the file and
+  line in a comment.
+- **Assert the outcome, not the verdict.** `response_decision` returning `False` is
+  not the same as the batch not completing.
+- **Print what a reader would see.** The notification text, the stored row, the
+  startup line. Several findings were only visible in the output: a genuine batch
+  whose group event could not be signed reports `0 finished`, which no verdict shows.
+
+### 8.7 When a claim does not survive
+
+Say what the code does, and keep the reasoning. These documents are the record of what
+was intended; a correction that deletes the intent loses the more useful half.
+
+The pattern that worked: leave the design section as written, add a findings section
+that says what the code does, and link the issue. §8.1–§8.3 above are that shape.
+
+And file the issue. Most of the thirteen were code bugs rather than wording mistakes,
+and they are tracked as [#885](https://github.com/rossoctl/examples/issues/885),
+[#886](https://github.com/rossoctl/examples/issues/886),
+[#887](https://github.com/rossoctl/examples/issues/887) and
+[#888](https://github.com/rossoctl/examples/issues/888).
+[#889](https://github.com/rossoctl/examples/issues/889), a pidfile crash-loop, came
+out of the same review without being a claim in any document. Documenting a bug
+honestly is not the same as accepting it.
+
+### 8.8 One note on the review process itself
+
+Most of the late rounds on #2609 fixed wording that a *previous round had suggested*.
+Both the author and the reviewer were writing sentences from the code's docstrings
+without running them, and both were wrong at about the same rate.
+
+Two habits came out of it:
+
+- **Change only the clause that was challenged.** Three separate rounds were spent
+  re-fixing something a previous fix had over-corrected, including one that deleted a
+  sentence which was itself the fix for an earlier round.
+- **A suggested wording is a hypothesis.** Run it before adopting it, including your
+  reviewer's — especially when it reads as though it came from a docstring.
+
