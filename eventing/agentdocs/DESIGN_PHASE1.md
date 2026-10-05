@@ -691,9 +691,15 @@ checks 8–9 exist before anything is deployed.
 | 10 | **Topic name collisions**: no pre-existing `KafkaTopic` or broker topic named `<ns>-requests` / `<ns>-responses` that this deploy does not own | another user took the name | resolves RQ-5; prevents consuming someone else's data |
 | 11 | Namespace exists or is creatable; quota admits the pods | quota exhausted | otherwise pods sit `Pending` with an unhelpful message |
 | 12 | Default StorageClass exists, if the overlay requests a PVC | no provisioner | PVC stays `Pending` forever |
+| 13 | **The claude CLI image is anonymously pullable and carries the CLI** (demo overlay only; skipped otherwise) | image missing, or built where the bundled `bun` cannot execute | T2.4's gate. Without it every real run fails with `claude binary not found` — and mock mode is exactly what stops the e2e from catching that. Runs on a cluster node rather than at build time because the CLI's `bun` aborts under QEMU user-mode emulation, so a cross-built image cannot execute it on an arm64 builder |
+
+Check 13 was added with the demo overlay and this table documented 12 for a while, which
+`IMPLEMENTATION_REPORT1.md` and `README_PHASE1.md` both reference by number — so the
+count is worth keeping right rather than discovering later that the design documents 12
+of 13.
 
 Check 9 necessarily runs *after* EventBridge is deployed, so preflight has two
-phases: checks 1–8 and 10–12 run before anything is applied, and check 9 runs
+phases: checks 1–8 and 10–13 run before anything is applied, and check 9 runs
 as the gate between deployment step 4 and step 5 (§13).
 
 **On a Kind cluster (§3.2)** the same checks apply, with three differences that are
@@ -714,7 +720,7 @@ implementation.
 these in order. The manual equivalents are shown because they are what you
 will type when debugging.
 
-**0. Preflight** — §12 checks 1–8, 10–12. Abort on any failure.
+**0. Preflight** — §12 checks 1–8, 10–13. Abort on any failure.
 
 **1. Namespace.**
 

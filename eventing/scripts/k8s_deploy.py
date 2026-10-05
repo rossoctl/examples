@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deploy in the §13 order, with the public URL as a hard gate. Tasks T4.2, T4.3.
 
-  0. Preflight (§12 checks 1-8, 10-12). Abort on any failure.
+  0. Preflight (§12 checks 1-8, 10-13). Abort on any failure.
   1. Namespace.
   2. Topics — in ns `kafka`, NOT the target namespace (Finding 1).
   3. The overlay: EventBridge + Service + Route + EventRunner + ScaledObject.
@@ -49,6 +49,9 @@ from imagelib import DEFAULT_REGISTRY, DEFAULT_TAG  # noqa: E402
 from k8slib import Kubectl, condition_is, condition_reason, dig, wait_for  # noqa: E402
 from proclib import Checks, die  # noqa: E402
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from shared import keyset, signing  # noqa: E402
+
 PREFIX = "deploy"
 HERE = pathlib.Path(__file__).resolve().parent
 K8S = HERE.parent / "k8s"
@@ -58,6 +61,13 @@ KAFKA_NS = "kafka"
 DIGEST_ANNOTATION = "rossoctl.dev/manifest-sha256"
 SECRET_NAME = "anthropic-credentials"
 NTFY_SECRET_NAME = "eventbridge-ntfy"
+# §11 — one seed Secret per service, never shared: a single seed would let either side
+# forge the other's signatures (DESIGN_PHASE2.md §4.3). The keyset is a ConfigMap
+# because it holds only public keys, and that location is what keeps the distinction
+# reviewable (shared/keyset.py).
+EB_SIGNING_SECRET = "eventbridge-signing-key"
+ER_SIGNING_SECRET = "eventrunner-signing-key"
+KEYSET_CONFIGMAP = "eventing-keyset"
 
 NTFY_HELP = f"""\
 Phone notifications are off unless NTFY_TOPIC is exported:
@@ -218,6 +228,132 @@ def ensure_ntfy_secret(k: Kubectl, c: Checks, ns: str, *, dry_run: bool) -> None
                  f"Secret/{NTFY_SECRET_NAME} applied from the environment")
 
 
+def ensure_signing_material(k: Kubectl, c: Checks, ns: str, keydir: str | None, *,
+                            dry_run: bool) -> None:
+    """Apply the per-service seed Secrets and the approved-key ConfigMap from a key
+    directory produced by `gen_signing_keys.py`.
+
+    **Two Secrets, one per service.** A single shared seed would mean EventBridge holds
+    the key it verifies runner responses with, so it could forge any agent's answer and
+    an agent could forge another's — the property that ruled out HMAC entirely
+    (DESIGN_PHASE2.md §4.3). Mounting separate Secrets is what keeps "only this agent
+    could have produced this" true.
+
+    A seed is a private key, so it gets the same handling as the API token: applied via
+    stdin so it never reaches `ps` through argv, never written into a manifest (a
+    kustomize secretGenerator would inline it into `kubectl kustomize` output, which the
+    §14.1 digest hashes and people paste into terminals), and logged only as a length.
+
+    The keyset is the opposite and is treated so on purpose: public keys only, applied as
+    a ConfigMap, kids logged in full. `KeySet.kids` is documented safe to log, and
+    printing them is what makes "the operator deployed yesterday's key set" visible
+    instead of surfacing later as an unexplained rejection.
+
+    Absent `--signing-keys` this is a no-op that leaves whatever is deployed alone, so a
+    redeploy cannot silently switch enforcement off and strand a signed topic.
+    """
+    if not keydir:
+        for name in (EB_SIGNING_SECRET, ER_SIGNING_SECRET):
+            if k.get("secret", name, namespace=ns, missing_ok=True) is not None:
+                c.log(f"--signing-keys not given; leaving the existing "
+                      f"Secret/{name} in place")
+        return
+
+    d = pathlib.Path(keydir).expanduser()
+    keyset_path = d / "agents.json"
+    if not keyset_path.is_file():
+        c.fail("signing key directory is usable",
+               f"{keyset_path} not found — run "
+               f"`python3 scripts/gen_signing_keys.py --out {d}` first")
+        return
+
+    # Validate before applying: a malformed keyset deployed into a cluster fails closed
+    # for every legitimate agent, which looks like a broken deployment rather than a
+    # security control. Better to refuse here, where the error names the file.
+    try:
+        ks = keyset.load(str(keyset_path))
+    except Exception as e:  # noqa: BLE001 - any parse/decode problem is the same answer
+        c.fail("the approved-key set parses", f"{keyset_path}: {e}")
+        return
+    if len(ks) == 0:
+        c.fail("the approved-key set approves at least one kid",
+               f"{keyset_path} is empty — enforcement would reject every event")
+        return
+
+    for secret_name, kid_env, kid_default in (
+            (EB_SIGNING_SECRET, "EB_SIGNING_KID", "eb-01"),
+            (ER_SIGNING_SECRET, "ER_SIGNING_KID", "runner-01")):
+        kid = os.environ.get(kid_env, "").strip() or kid_default
+        seed_file = d / kid / "seed.hex"
+        if not seed_file.is_file():
+            c.fail(f"seed for kid {kid!r} exists",
+                   f"{seed_file} not found. The overlay names this kid, so the service "
+                   f"would start, sign with nothing, and have every event refused.")
+            return
+        if kid not in ks:
+            c.fail(f"kid {kid!r} is in the approved set",
+                   f"{keyset_path} holds {list(ks.kids)} — a service signing under an "
+                   f"unapproved kid has every event refused by the other side")
+            return
+        seed_hex = seed_file.read_text().strip()
+        # The check the other four cannot make: that this seed DERIVES the public key the
+        # keyset approves for its kid. A kid present in both files with a mismatched pair
+        # passes every check above and produces exactly the cluster this function exists
+        # to prevent — pods start (both volumes are `optional: true`), enforcement is on,
+        # the service signs with a key nobody approved, and every event is refused with
+        # no local symptom.
+        #
+        # Reachable without hand-editing: an `agents.json` copied from a teammate or a
+        # previous cluster while the seeds on disk are local, a restored backup, or a
+        # partial regenerate.
+        try:
+            seed = signing.load_seed(str(seed_file))
+        except Exception as e:  # noqa: BLE001 - any decode problem is the same answer
+            c.fail(f"seed for kid {kid!r} is a usable Ed25519 seed", f"{seed_file}: {e}")
+            return
+        derived = signing.public_key(seed)
+        approved = ks.select(kid)
+        if derived != approved:
+            c.fail(
+                f"the seed for kid {kid!r} matches the approved public key",
+                f"{seed_file} derives {derived.hex()[:16]}… but {keyset_path} approves "
+                f"{approved.hex()[:16]}… for {kid!r}. Deploying this pair starts both "
+                f"services, signs with an unapproved key and has every event refused, "
+                f"with nothing local to look at. Regenerate the pair with "
+                f"`python3 scripts/gen_signing_keys.py --out {d} --force`, or restore "
+                f"the agents.json that goes with these seeds.")
+            return
+        manifest = {
+            "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+            "metadata": {"name": secret_name, "namespace": ns,
+                         "labels": {"app.kubernetes.io/part-of": "rossoctl-eventing"}},
+            # The mount's file name, and what ER_/EB_SIGNING_KEY_PATH points at.
+            "stringData": {"seed.hex": seed_hex},
+        }
+        # Length only. Not even a prefix: 4 hex chars of a 32-byte seed is 16 bits of a
+        # private key, and unlike an API token there is no benefit to identifying it.
+        c.log(f"Secret/{secret_name}: kid={kid} seed=({len(seed_hex)} hex chars)")
+        if dry_run:
+            c.log(f"--dry-run: Secret/{secret_name} was not applied")
+            continue
+        c.expect_run(k.apply_stdin(json.dumps(manifest), namespace=ns),
+                     f"Secret/{secret_name} applied for kid {kid}")
+
+    cm = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": KEYSET_CONFIGMAP, "namespace": ns,
+                     "labels": {"app.kubernetes.io/part-of": "rossoctl-eventing"}},
+        "data": {"agents.json": keyset_path.read_text()},
+    }
+    c.log(f"ConfigMap/{KEYSET_CONFIGMAP}: {len(ks)} approved kid(s): "
+          f"{', '.join(ks.kids)}")
+    if dry_run:
+        c.log(f"--dry-run: ConfigMap/{KEYSET_CONFIGMAP} was not applied")
+        return
+    c.expect_run(k.apply_stdin(json.dumps(cm), namespace=ns),
+                 f"ConfigMap/{KEYSET_CONFIGMAP} applied with {len(ks)} kid(s)")
+
+
 # ---- the steps --------------------------------------------------------------
 
 class Deployer:
@@ -285,6 +421,14 @@ class Deployer:
         # Any overlay may want phone notifications; the Secret is optional in the
         # manifest so this is safe when NTFY_TOPIC is unset.
         ensure_ntfy_secret(self.k, self.c, self.ns, dry_run=self.args.dry_run)
+        # §11 — before the apply, so the Secrets and keyset exist by the time the
+        # Deployments that mount them are created. `optional: true` on both volumes
+        # means a pod would still start without them, but it would start with
+        # enforcement on and no key, and refuse every event.
+        ensure_signing_material(self.k, self.c, self.ns, self.args.signing_keys,
+                                dry_run=self.args.dry_run)
+        if self.c.failed:
+            return      # a bad key directory must not reach a signed overlay
         res = self.k.apply_kustomize(str(self.overlay), server_dry_run=self.args.dry_run)
         if not self.c.expect_run(res, f"overlay {self.args.overlay} applied"):
             self.c.log(res.tail(15))
@@ -381,7 +525,13 @@ def build_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--namespace", "-n", default=os.environ.get("NS", "kev1"))
-    ap.add_argument("--overlay", default="test", choices=("test", "kind", "demo"))
+    ap.add_argument("--overlay", default="test",
+                    choices=("test", "kind", "demo", "kind-signed"))
+    ap.add_argument("--signing-keys", default=None, metavar="DIR",
+                    help="key directory from scripts/gen_signing_keys.py. Applies one "
+                         "seed Secret per service plus the approved-key ConfigMap. "
+                         "Required by the kind-signed overlay; omitting it leaves any "
+                         "already-deployed key material untouched.")
     ap.add_argument("--kubeconfig", default=None,
                     help="kubeconfig file (e.g. .kube/config-kind for a Kind cluster)")
     ap.add_argument("--context", default=None)
@@ -419,6 +569,19 @@ def main(argv=None) -> int:
     if not overlay_path(args.overlay).is_dir():
         die(f"no overlay at {overlay_path(args.overlay)}", prefix=PREFIX)
 
+    # The signed overlay turns enforcement on in the ConfigMap. Deploying it with no key
+    # material produces a cluster that refuses every event with no obvious cause — the
+    # pods start (both volumes are `optional: true`) and then reject everything. Refuse
+    # up front unless key material is already deployed.
+    if args.overlay == "kind-signed" and not args.signing_keys:
+        have = all(k.get("secret", n, namespace=args.namespace, missing_ok=True)
+                   is not None for n in (EB_SIGNING_SECRET, ER_SIGNING_SECRET))
+        if not have:
+            die("--overlay kind-signed enforces signatures but no key material is "
+                "deployed. Run `python3 scripts/gen_signing_keys.py --out DIR` then "
+                "pass --signing-keys DIR.", prefix=PREFIX)
+        c.log("no --signing-keys given, but both seed Secrets are already deployed")
+
     needed, reason = deploy_needed(k, c, d.overlay, args.namespace)
     c.log(f"change detection: deploy {'NEEDED' if needed else 'not needed'} — {reason}")
 
@@ -437,7 +600,7 @@ def main(argv=None) -> int:
         return c.summary()
 
     if not args.skip_preflight:
-        c.section("step 0: preflight (§12 checks 1-8, 10-12)")
+        c.section("step 0: preflight (§12 checks 1-8, 10-13)")
         skip = {int(s) for s in args.skip.split(",") if s.strip()}
         k8s_preflight.run_pre(k8s_preflight.Preflight(k, c, args), skip)
         if c.failed:

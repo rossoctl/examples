@@ -111,13 +111,30 @@ def test_the_demo_overlay_puts_home_on_the_volume():
 
 @needs_kubectl
 def test_the_test_overlay_mounts_no_credential_so_mock_mode_is_automatic():
-    """What makes the e2e test free and deterministic is that NOTHING can inject a
-    credential into these pods: no Secret is referenced, so config.py's
-    auto-detection selects mock mode itself. §14 assertion 7 then checks the pod
-    log says `auto:` — which also proves the detection path works in-cluster,
-    rather than bypassing it with an explicit override."""
+    """What makes the e2e test free and deterministic is that NOTHING can inject an
+    **Anthropic credential** into these pods, so config.py's auto-detection selects mock
+    mode itself. §14 assertion 7 then checks the pod log says `auto:` — which also proves
+    the detection path works in-cluster rather than bypassing it with an override.
+
+    **The assertion is about credentials, not about Secrets in general**, and that
+    distinction is now load-bearing. The base mounts the per-service *signing* Secrets as
+    `optional: true` volumes, so `secretName:` does appear in this overlay — a bare
+    `"secretRef" not in doc` kept passing only because a volume uses the other spelling,
+    which would have made this test green for a reason it does not document. It is
+    checked by name here: any Secret reference other than the two signing ones has to be
+    justified, and an `ANTHROPIC`-shaped one fails outright.
+    """
     doc = find_doc(render("test"), "Deployment", "eventrunner")
+    # `secretName` only — the volume is also called `signing-key`, which is a volume
+    # name rather than a Secret reference and must not be mistaken for one.
+    allowed_secrets = {"eventbridge-signing-key", "eventrunner-signing-key"}
+    referenced = set(re.findall(r"secretName:\s*(\S+)", doc))
+    assert referenced <= allowed_secrets, \
+        f"unexpected Secret reference: {sorted(referenced - allowed_secrets)}"
+    # No credential Secret, by either spelling, and nothing credential-shaped.
     assert "secretRef" not in doc, "the test overlay must mount no credential"
+    assert "anthropic" not in doc.lower(), \
+        "the test overlay must reference no Anthropic credential Secret"
     assert "ANTHROPIC" not in doc
     assert "ER_MOCK_CLAUDE" not in doc, \
         "leave the mode to auto-detection so the e2e exercises it"

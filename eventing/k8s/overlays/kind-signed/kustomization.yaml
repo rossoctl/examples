@@ -1,0 +1,90 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kev1
+
+# §11 — the `kind` overlay with signing ENFORCED on both directions. Everything that
+# makes it work (the volumes, the keyset ConfigMap, the config keys) is in the base and
+# defaults to off; this overlay only flips the switches.
+#
+# A separate overlay rather than a patch on `kind`, for two reasons:
+#
+#   * S3 and S5 (#2593/#2595) are explicitly **unsigned** milestones, so the plain
+#     `kind` path has to keep demonstrating the system without signatures — the
+#     before/after contrast is the demo.
+#   * `tests/test_manifests.py` asserts the `test` overlay mounts no credential at all
+#     so mock mode is auto-detected. Keeping enforcement out of the shared overlays
+#     means that assertion stays true and keeps meaning something.
+#
+# The Secret holding the seeds is NOT here and never will be:
+#   python3 scripts/gen_signing_keys.py --out ~/.eventing-keys
+#   python3 scripts/k8s_deploy.py --yes --overlay kind-signed --signing-keys ~/.eventing-keys
+resources:
+  - ../kind
+
+patches:
+  # Enforcement is a ConfigMap merge, not a `kubectl set env`: the values belong in the
+  # manifest so the digest in §14.1 covers them, and so `kubectl kustomize` shows an
+  # auditor exactly what is enforced. Only paths and kids live here — never a seed.
+  - target:
+      kind: ConfigMap
+      name: eventing-config
+    patch: |-
+      - op: replace
+        path: /data/ER_REQUIRE_SIGNATURE
+        value: "true"
+      - op: replace
+        path: /data/EB_REQUIRE_RESPONSE_SIGNATURE
+        value: "true"
+      # Both services verify against the SAME approved set, mounted from the
+      # `eventing-keyset` ConfigMap. One list, so approving an agent is one edit.
+      - op: replace
+        path: /data/ER_VERIFY_KEYSET_PATH
+        value: /etc/ce-keyset/agents.json
+      - op: replace
+        path: /data/EB_VERIFY_KEYSET_PATH
+        value: /etc/ce-keyset/agents.json
+      # The kid each service names in what it signs. EB_SIGNING_KID is also the only
+      # kid accepted on group lifecycle events, so an approved runner cannot forge a
+      # `group.completed` and end a batch early.
+      - op: replace
+        path: /data/ER_SIGNING_KID
+        value: runner-01
+      - op: replace
+        path: /data/EB_SIGNING_KID
+        value: eb-01
+      # Seed paths are NOT here. `configmap.yaml` says they "name Secret mounts and
+      # belong in the Deployment beside the volume", so they are set as container `env`
+      # entries on each Deployment below. An earlier revision of this overlay put them
+      # here and quoted that rule immediately before breaking it — no leak, since the
+      # value is a path, but a rule the repo states and a patch cites should not be a
+      # rule the patch breaks. The §14.1 digest covers the Deployments too, so nothing
+      # is lost by keeping them there.
+
+  # The seed paths, beside the volume that supplies the seed — which is the whole point
+  # of the location rule. `env` rather than the ConfigMap also keeps
+  # `test_manifests.py`'s Secret-vs-ConfigMap assertions able to mean what they say,
+  # including the Phase 3 tuple in #883 that is scoped to seed-path variables.
+  - target:
+      kind: Deployment
+      name: eventbridge
+    patch: |-
+      # `env` does not exist on the base container (only `envFrom`), so this adds the
+      # whole list rather than appending to it. A trailing-slash `env/-` op would fail
+      # with "path does not exist" at render time.
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: EB_SIGNING_KEY_PATH
+            value: /etc/ce-signing/seed.hex
+  - target:
+      kind: Deployment
+      name: eventrunner
+    patch: |-
+      # `env` does not exist on the base container (only `envFrom`), so this adds the
+      # whole list rather than appending to it. A trailing-slash `env/-` op would fail
+      # with "path does not exist" at render time.
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: ER_SIGNING_KEY_PATH
+            value: /etc/ce-signing/seed.hex
