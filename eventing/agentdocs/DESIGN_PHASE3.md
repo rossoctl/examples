@@ -1,6 +1,31 @@
 # DESIGN — Phase 3: per-user isolation, declarative agents, and event triggers
 
-Status: draft (revision 1) — **design only, nothing in this document is implemented yet.**
+Status: draft (revision 1) — **partly implemented.** §9's steps 1-4 are in the tree:
+T1 (`shared/tenancy.py`), T2 (`TopicSet` threaded through both services), T3 (`Caller`,
+the registry, `ce_userkey`), T4 (`SIGNED_ATTRS` += `userkey`, `depth`), T13 (`AgentSpec`)
+and T22 (the Secret-vs-ConfigMap test). **T5 is also in** — per-user stores
+(`store_registry.py`), the global `correlationid → userkey` index (`owner_index.py`), and
+the `Minter` uniqueness check that replaces the startup seeding loop (§2.6).
+`EB_TENANCY_MODE` defaults to `single`, which reproduces Phase 2 byte for byte, so nothing
+below is switched on anywhere yet.
+
+**`EB_TENANCY_MODE=multi` does not yet work end to end, and that is a stronger warning
+than "not yet isolated".** Until **T6** lands, neither consumer subscribes to the per-user
+topics — `kafka_in.Consumer` and `RequestsMirror` keep the configured `RESPONSE_TOPIC` /
+`REQUEST_TOPIC` while the runner publishes to `{prefix}-{userkey}-responses` — so **no
+response is ever consumed**: transcript pages stay empty, group counters never advance,
+and nothing is logged. `multi` is currently for developing against, not for running.
+
+Still design only: **T6** (`ensure_subscribed`, and the end-to-end gap above), **T7**
+(owner-scoped reads — the per-user stores exist and reads route to the owning tenant's
+store, but nothing yet checks that the *caller* is the owner, so `multi` mode's reads are
+still as open as Phase 2's; group *mutations* are authorized, because Phase 2 had no
+cross-tenant mutation to preserve), **T8** (transcript auth), **T9-T12** (capability keys,
+ntfy isolation, `k8s_tenant.py`), **T14-T19** (triggers and fetched skills), **T20** (Kafka
+ACLs), **T21** (retention and deletion).
+
+Where a section is implemented, the code is the authority on what it does; this document
+remains the authority on *why*.
 Scope: **delta over `DESIGN_PHASE2.md`.** Read that first, and §2.1 of it before
 anything else here.
 
@@ -290,13 +315,26 @@ Four decisions here:
 
 ### 2.6 What rides on the event, and the `sessionuuid` trap
 
-One new extension attribute, and a deliberate non-change:
+The tenancy key is the one this section is about; §1 lists all four attributes the phase
+adds, and `shared/ce.py` defines all four:
 
 ```text
 ce_submitter:    mrsabath                 # unchanged, Phase 2 §2.6
 ce_submitteriss: github                   # unchanged
-ce_userkey:      gh-mrsabath-4c1d9e07     # NEW — the tenancy key
+ce_userkey:      gh-mrsabath-4c1d9e07     # NEW — the tenancy key (this section)
+ce_agent:        triager                  # NEW — which AgentSpec serves it (§5.1)
+ce_depth:        1                        # NEW — the hop limit (§7.7)
+ce_triggerid:    nightly-triage           # NEW — attribution for a trigger (§7.2)
 ```
+
+**Three of the four are signed**: `userkey`, `depth` and `agent` all join
+`signing.SIGNED_ATTRS` in one change, per §8.3. `agent` belongs there for the same reason
+as the other two and arguably more urgently — it selects the `AgentSpec` that supplies
+`--permission-mode` and the tool allowlists, which §5.1 calls "the sandbox". Outside the
+signed set, anything with write access to a requests topic could rewrite `ce_agent` to
+name a wider policy *and the signature would still verify*, which makes a signed
+deployment worse than an unsigned one because an operator believes it is attested.
+`triggerid` is attribution only and nothing routes or authorizes on it.
 
 `userkey` joins `signing.SIGNED_ATTRS`. It must: it is what decides which store a
 response is written into and which ntfy topic it is announced on, so an unsigned,
@@ -326,6 +364,16 @@ before the socket binds, and at 100 tenants with 10,000 correlations each — th
 `__main__.py` already applies to the single-store seed today — that is a measurable
 startup delay for a guarantee one `SELECT` gives directly.
 
+**But the index still has to be populated once, and this paragraph read as if it did
+not.** Replacing a `seen` set *rebuilt on every start* with an index *consulted on every
+mint* is the right trade; it does not remove the need to get the pre-existing ids into
+that index the first time. An upgraded deployment starts with an empty `owners.sqlite`
+and a full `sessions.sqlite`, so `exists()` answers "free" for live ids and a mint can
+reissue one — overwriting a session and appending a new prompt to somebody else's
+conversation, where Phase 2's odds of that were zero. §6.1a records the seeding that
+closes it. The distinction worth keeping: *per-start seeding* is what §2.6 correctly
+rejects, and *one-time backfill* is what it accidentally rejected too.
+
 **The constraint has to be on `correlationid` alone**, and this is the part to get
 right. `(userkey, correlationid)` is the correct primary key *inside* a tenant's store
 (§6.1) and is exactly the wrong constraint for the global index: two tenants minting one
@@ -347,8 +395,16 @@ The brief's shape, with `{userid}` replaced by `{userkey}` for the reasons in §
 | inbox (§7) | `{prefix}-{userkey}-events` | EventBridge ingress (`POST /v0/events`) | EventBridge trigger dispatcher |
 | dead letter (§7.5) | `{prefix}-{userkey}-dead` | EventBridge | nobody; an operator with `kafka-console-consumer` |
 
+**In `single` mode** `requests` and `responses` are whatever `REQUEST_TOPIC` /
+`RESPONSE_TOPIC` already name, verbatim — that is what keeps a Phase 0/1/2 deployment
+unchanged. The two topics this table adds have no Phase 2 predecessor to stay compatible
+with, so they are derived from the prefix instead: `{prefix}-events` and `{prefix}-dead`.
+
 `{prefix}` defaults to the namespace (`kev1`), configurable as `EB_TOPIC_PREFIX`,
-exactly as Phase 1 §5 prefixes the shared-broker topics today. Longest realistic
+exactly as Phase 1 §5 prefixes the shared-broker topics today. It is validated as
+`[a-zA-Z0-9-]{1,32}`: it is the one component of these names `_slug` never sees, and `.`
+or `_` in it reproduces precisely the JMX metric collision §3.1's naming rules below warn
+about. Longest realistic
 name: `kev1-` + 2 + 1 + 24 + 1 + 8 + `-responses` = 51 characters, against Kafka's
 249 — comfortable, and worth having checked rather than assumed.
 
@@ -1393,8 +1449,67 @@ state into another user's next turn, which means putting words in their agent's 
       sessions.sqlite         # sessions, prompts, groups, group_members, transcripts
     gh-aslom-7b2e55a1/
       ...
-  shared/                     # tier `shared` (§3.8), and all of single-tenant mode
+  shared/                     # tier `shared` (§3.8), and any unattributable event
+  owners.sqlite               # the global correlationid -> userkey index (§6.1a)
+  responses.sqlite            # SINGLE-TENANT mode: the bridge root, NOT shared/
+  sessions.sqlite
 ```
+
+**Where single-tenant mode's files live, corrected.** An earlier revision of this section
+put them in `shared/`. The implementation deliberately leaves them in the bridge root,
+and that is the right call: a Phase 2 deployment already has `responses.sqlite` and
+`sessions.sqlite` directly in `{tmpdir}/eventbridge/`, so relocating them on upgrade would
+make every existing session and transcript vanish from the UI. `shared/` is therefore used
+only in multi-tenant mode, for the `shared` tier and for events that arrive with no usable
+`userkey`.
+
+### 6.1a The ownership index
+
+`owners.sqlite` is a **single, deliberately cross-tenant table** —
+`correlation_owner(correlationid PRIMARY KEY, userkey, created_utc)` — and it has to be:
+the lookup that decides which tenant owns a correlation must happen *before* a per-user
+store can be chosen. It holds nothing but the mapping.
+
+- **`correlationid` is the PRIMARY KEY, alone.** `(userkey, correlationid)` is correct
+  *inside* a tenant's store and exactly wrong here: two tenants minting one id produce two
+  distinct tuples, never conflict, and the collision passes silently. §2.6's guarantee that
+  `sessionuuid` can stay unsalted rests on this constraint.
+- **`userkey` is nullable**, meaning single-tenant mode or the `shared` tier. So the
+  uniqueness guarantee is in force for *every* deployment, including those that never turn
+  multi-tenancy on.
+- **`claim()` is idempotent for the same owner and raises `Collision` for a different
+  one.** A retried submit is not an error; two tenants claiming one id is. The `INSERT ...
+  ON CONFLICT DO NOTHING` plus follow-up read makes the *database* the authority, so a
+  conflict presents as `Collision` whether or not two writers race the in-process lock —
+  which matters because `Minter.mint` catches `Collision` specifically and would surface a
+  500 on `sqlite3.IntegrityError`.
+- **`owner_of()` returns `(userkey, known)`**, not a bare key. The two-value return is
+  load-bearing: a plain `None` cannot distinguish "the shared tier owns this" from "never
+  seen", and §6.2's `404` rule depends on telling them apart.
+- **It must be seeded once, from each store, at startup.** This is a correctness
+  requirement rather than an optimisation, and omitting it is a regression in the
+  *default* configuration. On the first start after an upgrade the index is empty while
+  `sessions.sqlite` is full, so `exists()` answers "free" for ids that are in use and
+  `Minter` can reissue one — overwriting a session and appending a new prompt to somebody
+  else's conversation. Phase 2's `seen` set was seeded from the store for exactly this
+  reason. §2.6 is right that one `SELECT` per mint beats re-seeding on every start; it does
+  not follow that the index never needs seeding *at all*.
+- **`mint_for()` degrades honestly.** A substitute `mint()` that cannot accept a `userkey`
+  mints an id that is never claimed, so the uniqueness guarantee falls back to whatever
+  that substitute implements. Reachable only from test doubles — `__main__` always builds a
+  real `Minter` with an index — but recorded here because §2.6 is where the guarantee is
+  claimed.
+- **Deletion tombstones; it never frees an id for reuse.** This is a §6.5 decision that
+  belongs here because the index is what enforces it. `forget()` clears the owner and sets
+  `deleted_utc`, keeping the row, because `exists()` is the `Minter`'s only uniqueness
+  check and **`sessionuuid` is unsalted**: a reissued `correlationid` derives *the same
+  session uuid* as the deleted one. A `claude` transcript left on a runner's volume, or a
+  checkpoint that outlived the delete, would then be resumable by the new correlation —
+  one user's conversation continuing inside somebody else's agent. The alternative is
+  guaranteeing every transcript keyed on that uuid is purged everywhere, including volumes
+  EventBridge does not own, which is not a guarantee this component can make. The cost is
+  one short row per deleted correlation. The owner is cleared so a tombstone discloses
+  nothing about whose the correlation was, which matters on a deletion path.
 
 The alternative is one database with a `userkey` column and a `WHERE` clause on every
 query. It is cheaper — one connection pair, one startup, no file-descriptor arithmetic —
@@ -1416,21 +1531,42 @@ rather than a `GROUP BY`.
 the main DB plus `-wal` and `-shm`). The default soft `RLIMIT_NOFILE` of 1024 therefore
 bounds this somewhere around 150–200 concurrently-open tenants before anything else the
 process holds — not 500, because WAL mode multiplies the count. So `StoreRegistry`
-opens lazily and closes on an LRU:
+opens lazily and **evicts** on an LRU:
 
 ```python
 # eventbridge/store_registry.py
 class StoreRegistry:
-    """userkey -> Store, opened on demand, closed on an LRU (EB_MAX_OPEN_STORES=64).
+    """userkey -> Store, opened on demand, evicted on an LRU (EB_MAX_OPEN_STORES=64).
 
-    Closing is safe because a Store is stateless above SQLite — every method opens a
-    transaction and commits. The ONE thing that is not: `Store.subscribe()` holds
-    threading.Events for live SSE viewers, so a store with subscribers is pinned and
-    exempt from eviction. Evicting it would make an open transcript page stop updating
-    with no error anywhere, which is the Phase 2 §6.1 class of bug — symptoms that look
-    like lost events.
+    Eviction DROPS THE REFERENCE; it does not close the store. A store with live SSE
+    subscribers is additionally pinned — kept in the cache — so a later reader resolves
+    the same object and sees the subscriber's notifications.
     """
 ```
+
+**"Closing is safe" was wrong, and the implementation corrected it.** An earlier revision
+of this section said the LRU *closes* stores and that closing is safe "because a Store is
+stateless above SQLite". The premise is true and the conclusion does not follow: a handler
+resolves a store and then makes several calls on it — `get_html` makes five — so a
+concurrent request for a different tenant could push the cache over its ceiling and close
+that store mid-use. The next call then fails with `sqlite3.ProgrammingError: Cannot
+operate on a closed database`, from a line with no visible connection to caching. Every
+multi-call read path was exposed.
+
+Eviction therefore drops the registry's reference and lets the interpreter close the
+connections when the last holder goes away, which is exactly the lifetime that is safe.
+Two consequences worth recording:
+
+- **File descriptors are reclaimed slightly later than an explicit close.** That is the
+  right trade: the ceiling is a soft budget and over-running it degrades visibly on
+  `/healthz`, whereas a closed connection under an in-flight request is a 500.
+- **The store being returned is never the eviction victim** (`protect=`). Without that, a
+  cache whose older entries are all pinned evicted the newest — and handed the caller the
+  store it had just closed.
+
+A note on the fix that is worth more than the fix: the first attempt pinned only the SSE
+path, because that was the case easiest to see. It closed one instance and left the class
+open. The bug was in the eviction contract, not in one caller.
 
 The response consumer writes to whichever store `ce_userkey` names. An event with no
 `userkey` in multi-tenant mode goes to `shared/` and increments an `unattributed`
@@ -1917,14 +2053,23 @@ upgrades and changes nothing behaves exactly as it did in Phase 2.
 
 ### 8.3 Two notes that are not table rows
 
-**The signed-attribute set changes twice, and both changes must land together.**
-`userkey` (§2.6) and `depth` (§7.7) both join `signing.SIGNED_ATTRS`. Phase 2 §4.2
-already set the precedent and the rule: adding an attribute changes canonicalisation, so
-a signer and a verifier on different versions disagree about every signature. Doing it
-in two commits would invalidate canonicalisation twice for no benefit, so it is **one
-change**, and deployments with signing already enabled must upgrade both services
-together. Deployments with signing off (the default) are unaffected, which is most of
-them.
+**The signed-attribute set changes once, for three attributes, and that change must
+land in one commit.** `userkey` (§2.6), `depth` (§7.7) and `agent` (§5.1) all join
+`signing.SIGNED_ATTRS`. Phase 2 §4.2 already set the precedent and the rule: adding an
+attribute changes canonicalisation, so a signer and a verifier on different versions
+disagree about every signature. Doing it in three commits would invalidate
+canonicalisation three times for no benefit, so it is **one change**, and deployments
+with signing already enabled must upgrade both services together. Deployments with
+signing off (the default) are unaffected, which is most of them.
+
+An earlier revision of this paragraph said "changes twice" and named only `userkey` and
+`depth`. `agent` belongs in the set for the same reason as the other two and arguably
+more urgently: it selects the `AgentSpec` that supplies `--permission-mode` and the tool
+allowlists, which §5.1 calls "the sandbox". Outside the signed set, anything with write
+access to a requests topic could rewrite `ce_agent` to name a spec with a wider policy
+and **the signature would still verify** — making a signed deployment worse than an
+unsigned one, because an operator believes it is attested. §2.6 has the full list of what
+rides on the event and which three are signed.
 
 **Secret-vs-ConfigMap, continuing Phase 2 §5's rule.** Seed and HMAC-secret paths
 (`EB_NTFY_TOPIC_SECRET_PATH`, `EB_CAPABILITY_SECRET_PATH`, `EB_WEBHOOK_SECRETS_PATH`)

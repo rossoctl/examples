@@ -145,13 +145,26 @@ def compose_title(event: dict[str, Any]) -> str:
 # --- Publisher thread ------------------------------------------------------
 
 class NtfyPublisher(threading.Thread):
-    def __init__(self, cfg: NtfyCfg, public_base_url: str, store=None) -> None:
+    def __init__(self, cfg: NtfyCfg, public_base_url: str, store=None,
+                 stores=None) -> None:
         super().__init__(daemon=True, name="ntfy-publisher")
         self._cfg = cfg
         self._base = public_base_url.rstrip("/")
         self._store = store
+        # §6.1 — resolve the store per event, from its own `ce_userkey`. Without this,
+        # `_last_prompt` and `_last_assistant_text` read only the shared store, so in
+        # multi-tenant mode a notification for a tenant's correlation arrives with no
+        # prompt and no reply — exactly the content §4.1 says the body carries so a phone
+        # that cannot reach EventBridge still sees the result.
+        self._stores = stores
         self._q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._stopping = threading.Event()
+
+    def _store_for(self, event: dict[str, Any]):
+        """The store holding this event's prompt and replies."""
+        if self._stores is None:
+            return self._store
+        return self._stores.for_event(event)
 
     def submit(self, event: dict[str, Any]) -> None:
         if not self._cfg.enabled or not self._cfg.topic:
@@ -186,15 +199,17 @@ class NtfyPublisher(threading.Thread):
         for the whole life of the group.
         """
         groupid = event.get("groupid")
-        if not groupid or self._store is None:
+        store = self._store_for(event)
+        if not groupid or store is None:
             return False
         if self._cfg.group_notify_errors and event.get("phase") == "error":
             return False
         try:
             # An unknown groupid is treated as ungrouped: if we have no group row we
             # will never send group notifications either, so suppressing would mean
-            # sending nothing at all.
-            return self._store.get_group(groupid) is not None
+            # sending nothing at all. Routed by the event's own userkey for the same
+            # reason as the body lookup — the group row is in its owner's store.
+            return store.get_group(groupid) is not None
         except Exception:  # noqa: BLE001
             return False
 
@@ -265,7 +280,7 @@ class NtfyPublisher(threading.Thread):
         corr  = event.get("correlationid", "?")
         phase = event.get("phase", "?")
 
-        body_msg = compose_body(event, self._store)
+        body_msg = compose_body(event, self._store_for(event))
         title    = compose_title(event)
         tags     = ["robot", phase]
         if phase == "error":

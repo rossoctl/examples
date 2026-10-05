@@ -20,9 +20,13 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 K8S = ROOT / "k8s"
+# `kind-signed` (#884) is included deliberately: it was absent when that PR added the
+# overlay, so every assertion in this file silently skipped the one overlay that turns
+# signing on — including the seed-path rule the PR exists to respect.
 OVERLAYS = {"test": K8S / "overlays" / "test",
             "kind": K8S / "overlays" / "kind",
-            "demo": K8S / "overlays" / "demo"}
+            "demo": K8S / "overlays" / "demo",
+            "kind-signed": K8S / "overlays" / "kind-signed"}
 
 _HAVE_KUBECTL = shutil.which("kubectl") is not None
 
@@ -153,6 +157,196 @@ def test_no_credential_is_ever_rendered_into_a_manifest():
             f"{overlay} renders a Secret — credentials must be applied separately"
         for marker in ("sk-ant-", "sk-", "ANTHROPIC_AUTH_TOKEN:", "ANTHROPIC_API_KEY:"):
             assert marker not in rendered, f"{overlay} may leak a credential ({marker!r})"
+
+
+#: Phase 3 §8.3, continuing Phase 2 §5's rule. Every variable naming a path that
+#: contains key material must come from a **Secret** mount, never from the committed
+#: `config.toml` and never with a literal value in a ConfigMap. The rule is only worth
+#: having if a test enforces it, which is T22.
+#:
+#: NOTE: none of these are read by `config.py` yet — they arrive with T8 (transcript
+#: auth), T9 (capability keys), T10 (derived ntfy topics) and T16 (webhook ingress). They
+#: are listed now on purpose, so the guard is already in place when the variable lands
+#: rather than being remembered afterwards. `test_every_phase3_variable_is_classified`
+#: deliberately does NOT require these to be read, which is why it only asserts the
+#: ConfigMap side against live code.
+SECRET_VALUE_VARS = (
+    "EB_NTFY_TOPIC_SECRET_PATH",
+    "EB_CAPABILITY_SECRET_PATH",
+    "EB_WEBHOOK_SECRETS_PATH",
+)
+
+#: The signing seed paths, from #884. Same §5 rule, different obligation — and the
+#: distinction is the one that PR had to settle: these hold a **mount point**, not key
+#: material, so a literal value is correct. What they must not do is come from the
+#: committed ConfigMap: `configmap.yaml` says seed paths "name Secret mounts and belong
+#: in the Deployment beside the volume", and #884 moved them to a container `env` entry
+#: for exactly that reason after an earlier revision put them in `eventing-config` and
+#: quoted the rule immediately before breaking it.
+SEED_PATH_VARS = (
+    "ER_SIGNING_KEY_PATH",
+    "EB_SIGNING_KEY_PATH",
+)
+
+#: Both groups obey "never from `config.toml`", which is what
+#: `test_secret_path_variables_are_never_set_from_the_committed_config` checks.
+SECRET_PATH_VARS = SECRET_VALUE_VARS + SEED_PATH_VARS
+
+#: The other side of the same rule: these record what an operator approved and grant
+#: nothing, so a ConfigMap (or an image path) is correct and a Secret would be cargo
+#: cult. Listed explicitly so the next variable added lands on one side deliberately.
+CONFIGMAP_VARS = (
+    "EB_TENANCY_MODE",
+    "EB_TOPIC_PREFIX",
+    "EB_USER_REGISTRY_PATH",
+    "EB_MAX_OPEN_STORES",
+    "ER_AGENT_DIR",
+    "ER_AGENT_NAME",
+    "ER_USERKEY",
+)
+
+
+def test_secret_path_variables_are_never_set_from_the_committed_config():
+    """A seed path in `config.toml` means the whole signing/notification block can be
+    half-configured from a file in git."""
+    toml = (ROOT / "eventbridge" / "config.toml").read_text()
+    for var in SECRET_PATH_VARS:
+        assert var not in toml, f"{var} must be env-only (DESIGN_PHASE3.md §8.3)"
+        # The TOML spelling of the same thing — a lower-cased key without the prefix.
+        key = var.removeprefix("EB_").lower()
+        assert key not in toml, f"{key} in config.toml reintroduces {var} by another name"
+
+
+@needs_kubectl
+def test_no_phase3_secret_is_inlined_into_a_manifest():
+    """The §8.3 rule, checked where it would actually leak: rendered output.
+
+    **A path naming a secret is not a secret.** `*_SIGNING_KEY_PATH` holds
+    `/etc/ce-signing/seed.hex` — a mount point, not key material — and #884 deliberately
+    sets it as a container `env` entry so it sits *beside the volume that supplies the
+    seed*, which is what `configmap.yaml` asks for. So a literal value is correct for
+    those, and the rule they must obey is a different one: the **seed itself** must never
+    appear, and the path must not be set from the committed ConfigMap.
+
+    The variables whose *value* is key material — none of them read yet, see the note on
+    SECRET_PATH_VARS — must have no literal value anywhere.
+    """
+    for overlay in OVERLAYS:
+        rendered = render(overlay)
+        for var in SECRET_VALUE_VARS:
+            # Referencing the variable is fine; giving it a literal sibling value is
+            # not. A `secretKeyRef` has no `value:` on the same key.
+            #
+            # `\s*` rather than hardcoded indentation: ten spaces matches the demo
+            # overlay's container `env:` today, but the same variable inlined in an
+            # initContainer, a sidecar or a deeper patch would pass silently.
+            # test_manifests.py's own earlier tests use `\s*` for this reason.
+            inlined = re.search(rf"name:\s*{re.escape(var)}\s*\n\s*value:", rendered)
+            assert f"{var}:" not in rendered and not inlined, \
+                f"{overlay} appears to inline {var} rather than mounting a Secret"
+        # The seed-path variables: a literal value is fine, a ConfigMap key is not.
+        # `f"{var}:"` matches the ConfigMap `data:` spelling (`VAR: value`) but not the
+        # env-entry spelling (`- name: VAR` / `value: …`), which is the distinction.
+        for var in SEED_PATH_VARS:
+            assert f"{var}:" not in rendered, \
+                (f"{overlay} sets {var} as a ConfigMap key; `configmap.yaml` says seed "
+                 f"paths name Secret mounts and belong in the Deployment beside the "
+                 f"volume (see #884)")
+    # And no seed material, by any route, in any overlay.
+    for overlay in OVERLAYS:
+        rendered = render(overlay)
+        assert "seed.hex:" not in rendered, f"{overlay} may inline a seed"
+
+
+#: Variables that pre-date §8.3 and are therefore out of its scope. Retro-classifying all
+#: 36 is a separate change from making the rule hold for anything new, so they are listed
+#: here explicitly — and `test_the_baseline_list_is_still_accurate` keeps the list honest
+#: by checking it against the config files rather than trusting it.
+PRE_PHASE3_VARS = (
+    "EB_ALLOWED_USERS", "EB_AUTH_TOKENS", "EB_GITHUB_CACHE_TTL_S",
+    "EB_GITHUB_CLIENT_ID", "EB_GROUP_DEADLINE_S", "EB_HTTP_ADDR",
+    "EB_REQUIRE_RESPONSE_SIGNATURE", "EB_SIGNING_KEY_PATH", "EB_SIGNING_KID",
+    "EB_TRANSCRIPT_MAX_BYTES", "EB_VERIFY_KEYSET_PATH", "EB_WORKERS",
+    "ER_COMMIT_AFTER_TERMINAL", "ER_CONSUMER_GROUP", "ER_DEDUPE_FINAL_TEXT",
+    "ER_DRAIN_TIMEOUT_S", "ER_EMIT_SYSTEM_HOOKS", "ER_EVENTBRIDGE_URL",
+    "ER_FINAL_COMMIT_WAIT_S", "ER_HEARTBEAT_MAX_AGE_S", "ER_HEARTBEAT_PATH",
+    "ER_INCLUDE_RAW", "ER_KAFKA_RETRY_INITIAL_S", "ER_KAFKA_RETRY_MAX_S",
+    "ER_MAX_CONCURRENT", "ER_MAX_REQUEST_AGE_S", "ER_MOCK_CLAUDE",
+    "ER_MOCK_DELAY_MAX_S", "ER_MOCK_DELAY_MIN_S", "ER_REQUIRE_SIGNATURE",
+    "ER_SIGNING_KEY_PATH", "ER_SIGNING_KID", "ER_TRANSCRIPT_MAX_BYTES",
+    "ER_TRANSCRIPT_SYNC", "ER_VERIFY_KEYSET_PATH", "ER_VERIFY_KEY_PATH",
+)
+
+
+def _vars_read(path: pathlib.Path) -> set[str]:
+    """Every `EB_*`/`ER_*` name a config file reads via the `e("VAR")` idiom."""
+    return set(re.findall(r'e\("((?:EB|ER)_[A-Z0-9_]+)"', path.read_text()))
+
+
+def test_the_baseline_list_is_still_accurate():
+    """A stale `PRE_PHASE3_VARS` entry silently widens the exemption above.
+
+    If a pre-Phase-3 variable is removed from `config.py` and left here, it keeps
+    exempting a name nobody reads — harmless — but if one is *renamed*, the new name
+    becomes unclassified and the check above catches it. This asserts the simpler
+    property: every name here is still read somewhere.
+    """
+    found = (_vars_read(ROOT / "eventbridge" / "config.py")
+             | _vars_read(ROOT / "eventrunner" / "config.py"))
+    stale = set(PRE_PHASE3_VARS) - found
+    assert not stale, (
+        f"{sorted(stale)} are in PRE_PHASE3_VARS but no config.py reads them; "
+        f"remove them so the §8.3 exemption stays as narrow as it should be")
+
+
+def test_every_phase3_variable_is_classified():
+    """A variable in neither list is one nobody answered the §8.3 question about.
+
+    **Both directions matter, and only one of them enforces the rule.**
+    `CONFIGMAP_VARS ⊆ found` catches a stale entry here. The direction that catches a NEW
+    variable classified as neither is `found ⊆ CONFIGMAP_VARS ∪ SECRET_PATH_VARS` — which
+    is the case this test exists for, and which an earlier version of it did not check.
+    """
+    eb = ROOT / "eventbridge" / "config.py"
+    er = ROOT / "eventrunner" / "config.py"
+    found = _vars_read(eb) | _vars_read(er)
+
+    # The sanity check that this test is looking at the right thing at all. If the
+    # `e("VAR")` idiom ever changes, `found` goes empty and every assertion below passes
+    # vacuously — so fail loudly here instead.
+    assert "EB_TENANCY_MODE" in found and len(found) > 10, \
+        'config.py does not look like it was parsed; did the `e("VAR")` idiom change?'
+
+    # Every ConfigMap-side variable must actually be read by the code — a stale entry
+    # here would silently stop checking anything. The Secret-side ones are deliberately
+    # exempt: they are declared ahead of the tasks that introduce them (see the note on
+    # SECRET_PATH_VARS), and requiring them now would just force a placeholder read.
+    for var in CONFIGMAP_VARS:
+        assert var in found, f"{var} is listed here but no config.py reads it"
+
+    # THE DIRECTION THAT ENFORCES §8.3. Scoped to variables Phase 3 introduced: the
+    # pre-Phase-3 ones pre-date the rule, and retro-classifying 36 of them is a separate
+    # change from making the rule hold for new ones.
+    baseline = set(PRE_PHASE3_VARS)
+    unclassified = found - set(CONFIGMAP_VARS) - set(SECRET_PATH_VARS) - baseline
+    assert not unclassified, (
+        f"{sorted(unclassified)} are read by config.py but classified as neither "
+        f"ConfigMap nor Secret. DESIGN_PHASE3.md §8.3 requires the question be answered: "
+        f"add each to CONFIGMAP_VARS or SECRET_PATH_VARS in this file.")
+
+
+def test_the_classification_check_can_actually_fail():
+    """The deliberate-failure check the review asked for.
+
+    A test whose failure mode has never been observed is a test nobody should trust —
+    `test_every_phase3_variable_is_classified` replaced an assertion that could not fail
+    for its stated reason, so this one proves the replacement does.
+    """
+    baseline = set(PRE_PHASE3_VARS)
+    pretend_found = {"EB_TENANCY_MODE", "EB_SOMETHING_NEW_X"} | baseline
+    unclassified = pretend_found - set(CONFIGMAP_VARS) - set(SECRET_PATH_VARS) - baseline
+    assert unclassified == {"EB_SOMETHING_NEW_X"}, \
+        "an unclassified new variable must be detected"
 
 
 @needs_kubectl

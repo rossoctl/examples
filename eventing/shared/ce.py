@@ -61,6 +61,25 @@ EXT_SUBMITTER     = "submitter"
 # `ce_` prefix and validate nothing, so it round-trips here and is rejected or
 # silently dropped by a spec-compliant consumer a hop later.
 EXT_SUBMITTER_ISS = "submitteriss"
+# Phase 3 §2.6 — the tenancy key, from `shared.tenancy.userkey(issuer, userid)`.
+#
+# Unlike `submitter`, which Phase 2 only ever compared and printed, this one is
+# load-bearing: it decides which store a response is written into and which ntfy topic
+# it is announced on. So it is in `signing.SIGNED_ATTRS` — an unsigned, mutable
+# `userkey` would let anything with write access to a topic file an event into another
+# user's history.
+#
+# Absent in single-tenant mode, which is the default and reproduces Phase 2 exactly.
+EXT_USERKEY = "userkey"
+# Phase 3 §5.1 — which agent definition should serve this request. Absent means the
+# runner's own `ER_AGENT_NAME`, then `default`.
+EXT_AGENT = "agent"
+# Phase 3 §7.7 — hop count, incremented each time an event causes another event. The
+# loop control the trigger API lives or dies by, which is why it is signed: a resettable
+# depth is not a hop limit at all, it is a suggestion an attacker declines.
+EXT_DEPTH = "depth"
+# Phase 3 §7.2 — the trigger that caused this request, for attribution on the response.
+EXT_TRIGGERID = "triggerid"
 
 CE_HEADER_PREFIX = "ce_"
 CORE_ATTRS = {"specversion", "type", "source", "id", "time",

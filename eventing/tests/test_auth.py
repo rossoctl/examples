@@ -29,8 +29,10 @@ class FakeProducer:
         self.requests.append(kw)
         return f"evt-{len(self.requests)}"
 
-    def publish_group_event(self, *, type_, groupid, data, subject="group"):
-        self.group_events.append({"type": type_, "groupid": groupid, "data": data})
+    def publish_group_event(self, *, type_, groupid, data, subject="group",
+                            userkey=None):
+        self.group_events.append({"type": type_, "groupid": groupid, "data": data,
+                                  "userkey": userkey})
         return f"gevt-{len(self.group_events)}"
 
 

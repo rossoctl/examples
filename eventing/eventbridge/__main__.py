@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 
+from eventbridge import registry
 from eventbridge.config import load
 from eventbridge.correlation import Minter
 from eventbridge.group_service import GroupService
@@ -19,8 +20,9 @@ from eventbridge.kafka_requests_mirror import RequestsMirror
 from eventbridge.netcands import enumerate_candidates, format_startup_hint
 from eventbridge.ntfy import NtfyPublisher
 from eventbridge.openapi import spec
+from eventbridge.owner_index import OwnerIndex
 from eventbridge.router import Dispatcher
-from eventbridge.store import Store
+from eventbridge.store_registry import StoreRegistry
 from shared import keyset, signing
 from shared.pidfile import PidFile
 
@@ -42,10 +44,12 @@ def main() -> int:
     oas_path.parent.mkdir(parents=True, exist_ok=True)
     oas_path.write_text(json.dumps(spec(), indent=2))
 
-    store = Store(pathlib.Path(cfg.tmpdir) / "eventbridge")
-    minter = Minter()
-    for corr in store.all_correlations(limit=10000):
-        minter.remember(corr)
+    eb_root = pathlib.Path(cfg.tmpdir) / "eventbridge"
+    # §2.6 — the global `correlationid -> userkey` index. Always built, including in
+    # single-tenant mode: the uniqueness guarantee it provides is worth having for every
+    # deployment, and it is what replaces the startup seeding loop below.
+    owners = OwnerIndex(eb_root)
+    minter = Minter(index=owners)
 
     # §11 — key material is loaded ONCE, here, and deliberately not caught. A bridge
     # that believes it is signing but is not fails silently; one that will not start
@@ -76,14 +80,105 @@ def main() -> int:
         print("[eventbridge] response verification OFF "
               "(set EB_VERIFY_KEYSET_PATH to enable)")
 
+    # Phase 3 §3.2: one TopicSet, built once here and handed to everything that names a
+    # topic, so §3.1's layout appears exactly once in the codebase. In `single` mode
+    # every method returns the configured request/response topic, which is what makes
+    # this step a pure refactor — the existing suite is the check.
+    topics = cfg.topics
+    print(f"[eventbridge] tenancy={cfg.tenancy_mode}"
+          + (f" prefix={cfg.topic_prefix}" if topics.multi else
+             f" requests={cfg.request_topic} responses={cfg.response_topic}"))
+
+    # §2.5 — a bad registry must stop startup, but as a readable refusal rather than a
+    # traceback: this is an operator-facing configuration error, and the message (which
+    # names both the recorded and the derived userkey) is the whole point. A traceback
+    # buries it under frames nobody reading `kubectl logs` needs.
+    try:
+        users = registry.load(cfg.user_registry_path)
+    except registry.RegistryError as e:
+        raise SystemExit(f"[eventbridge] user registry: {e}") from None
+    if topics.multi:
+        if not cfg.user_registry_path:
+            raise SystemExit(
+                "[eventbridge] EB_TENANCY_MODE=multi requires EB_USER_REGISTRY_PATH. "
+                "Per-user isolation has no meaning without a list of users to isolate. "
+                "See DESIGN_PHASE3.md §2.5.")
+        if not len(users):
+            # Phase 2 §2.4's reading, for Phase 2's reason: the other one turns a
+            # missing file into an open door.
+            raise SystemExit(
+                f"[eventbridge] the user registry at {cfg.user_registry_path} approves "
+                f"nobody. An empty registry denies everyone; add a user or run with "
+                f"EB_TENANCY_MODE=single.")
+        print(f"[eventbridge] registry: {len(users)} user(s) — "
+              f"{', '.join(users.userkeys)}")
+    elif len(users):
+        # Harmless, but worth saying: a registry that is loaded and ignored is usually
+        # somebody who set the path and forgot the mode.
+        print(f"[eventbridge] registry has {len(users)} user(s) but "
+              f"EB_TENANCY_MODE=single, so it is not consulted")
+
+    # §6.1 — per-user stores. Built after `topics` because the layout depends on the
+    # mode: single-tenant keeps `responses.sqlite`/`sessions.sqlite` directly in the
+    # bridge root, so a Phase 2 deployment's existing sessions and transcripts stay
+    # exactly where they are and keep showing up in the UI.
+    stores = StoreRegistry(eb_root, max_open=cfg.max_open_stores,
+                           multi=topics.multi)
+    # The `shared` store: single-tenant mode's only store, and multi-tenant mode's home
+    # for anything that arrives without a `userkey` (§6.1's `unattributed` path).
+    store = stores.for_userkey(None)
+
+    # Seed the ownership index from what is already on disk. REQUIRED for correctness on
+    # the first start after an upgrade, not an optimisation: the index is new and empty
+    # while `sessions.sqlite` still holds every pre-Phase-3 correlation, so without this
+    # `exists()` reports live ids as free and `Minter` can reissue one — overwriting a
+    # session and appending a new prompt to somebody's existing conversation. Phase 2
+    # seeded its `seen` set from the store for exactly this reason, and dropping that loop
+    # without replacing it was a regression in the DEFAULT configuration.
+    #
+    # Cheap after the first run: `INSERT OR IGNORE` over ids the index already holds, and
+    # `all_correlations` is one indexed query per store. The `limit` matches the 10,000
+    # Phase 2 applied to its own seed.
+    # `needs_seeding` is checked FIRST so an already-seeded store is never opened and
+    # never scanned. Without that gate this loop is the per-start N-store seeding §2.6
+    # rejects: `seed_from` is `INSERT OR IGNORE` so repeating it is harmless to
+    # correctness, but the cost §2.6's whole argument is about — two SQLite connections
+    # and an indexed scan per tenant, before the socket binds — was being paid on every
+    # boot. Measured at ~210 ms per restart for 100 tenants x 200 correlations, and §2.6's
+    # own worked example (100 x 10,000) extrapolates to ~6 s added to every restart.
+    #
+    # Skipping is sound because nothing can add an UNINDEXED id to a store after it is
+    # seeded: every mint claims as it mints, so a seeded store cannot later acquire one.
+    seeded = 0
+    if owners.needs_seeding():
+        seeded += owners.seed_from(store.all_correlations(limit=10000))
+    if topics.multi:
+        # Every tenant's store too, otherwise a tenant's existing ids stay invisible to
+        # the uniqueness check. `known_userkeys` reads the filesystem rather than the LRU,
+        # so a tenant that is merely closed is still seeded.
+        for uk in stores.known_userkeys():
+            if not owners.needs_seeding(uk):
+                continue
+            seeded += owners.seed_from(
+                stores.for_userkey(uk).all_correlations(limit=10000), uk)
+    if seeded:
+        print(f"[eventbridge] seeded {seeded} pre-existing correlation(s) into the "
+              f"ownership index")
+    if topics.multi:
+        print(f"[eventbridge] per-user stores under {eb_root}/users "
+              f"(max_open={cfg.max_open_stores}), "
+              f"{owners.count()} correlation(s) in the ownership index")
+
     # The producer needs the RESPONSES topic too: group lifecycle events go there,
     # not on requests, because EventRunner would try to execute anything on requests.
     producer = Producer(cfg.kafka_bootstrap, cfg.request_topic, cfg.source_uri,
                         response_topic=cfg.response_topic,
-                        seed=seed, kid=cfg.signing_kid or None)
-    groups = GroupService(cfg, store, producer, minter)
+                        seed=seed, kid=cfg.signing_kid or None,
+                        topics=topics)
+    groups = GroupService(cfg, store, producer, minter, stores=stores)
 
-    ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store)
+    ntfy = NtfyPublisher(cfg.ntfy, cfg.public_base_url, store=store,
+                         stores=stores if topics.multi else None)
     if cfg.ntfy.enabled and cfg.ntfy.topic:
         ntfy.start()
 
@@ -93,22 +188,32 @@ def main() -> int:
                         on_member_event=groups.on_member_event,
                         keyset=ks,
                         require_signature=cfg.require_response_signature,
-                        bridge_kid=cfg.signing_kid or None)
+                        bridge_kid=cfg.signing_kid or None,
+                        topics=topics,
+                        stores=stores if topics.multi else None)
     consumer.start()
 
     # Back-fill prompts from the requests topic — also gives us prompt visibility
     # for correlations we didn't originate ourselves.
-    requests_mirror = RequestsMirror(cfg.kafka_bootstrap, cfg.request_topic, store)
+    requests_mirror = RequestsMirror(cfg.kafka_bootstrap, cfg.request_topic, store,
+                                     topics=topics,
+                                     stores=stores if topics.multi else None)
     requests_mirror.start()
 
     # §21.2: rebuild group history from the responses topic. The live consumer above
     # commits offsets and so never re-reads, which meant a restarted pod (with an
     # emptyDir /data) served 404 for every earlier group even though its notifications
     # had already gone out. One-shot, never publishes, never notifies.
-    group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups)
+    group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups,
+                               topics=topics,
+                               userkeys=users.userkeys if topics.multi else (),
+                               owners=owners if topics.multi else None)
     group_mirror.start()
 
-    h = Handlers(cfg, store, producer, minter, groups=groups)
+    h = Handlers(cfg, store, producer, minter, groups=groups,
+                 registry=users if topics.multi else None,
+                 stores=stores if topics.multi else None,
+                 owners=owners if topics.multi else None)
     dsp = Dispatcher()
     dsp.add("POST", r"/v0/agents",                                          h.start_agent)
     dsp.add("POST", r"/v0/agents/(?P<correlationid>[a-z0-9-]+)/continue",   h.continue_agent)

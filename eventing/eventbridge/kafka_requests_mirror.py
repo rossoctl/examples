@@ -20,16 +20,30 @@ import threading
 from kafka import KafkaConsumer
 
 from eventbridge.store import Store
-from shared import ce
+from shared import ce, tenancy
 
 
 class RequestsMirror(threading.Thread):
     def __init__(self, bootstrap: str, request_topic: str, store: Store,
-                 group_id: str | None = None) -> None:
+                 group_id: str | None = None,
+                 topics: tenancy.TopicSet | None = None,
+                 stores=None) -> None:
         super().__init__(daemon=True, name="kafka-requests-mirror")
         self._bootstrap_servers = bootstrap
-        self._topic = request_topic
+        # §3.2: "RequestsMirror needs the same treatment" as the responses consumer —
+        # it is what back-fills prompts for correlations the bridge did not originate,
+        # so a topic it is not subscribed to is a correlation with no prompt. The
+        # per-user subscription management is T6; this threads the set through.
+        self._topics = topics or tenancy.TopicSet(
+            "", request_topic=request_topic, response_topic="")
+        self._topic = self._topics.requests() if not self._topics.multi else request_topic
         self._store = store
+        # §6.1 — route each back-filled prompt into the store its own `ce_userkey` names.
+        # Without this the mirror knows the per-tenant TOPIC names and still writes every
+        # prompt into the shared store, so a correlation whose request the bridge did not
+        # originate shows a BLANK PROMPT on its owner's page — which is precisely the gap
+        # this mirror exists to close.
+        self._stores = stores
         # Per-process group id so every EB start re-scans the whole topic.
         # `backfill_prompt_if_missing()` makes re-inserts a no-op, so this
         # is idempotent and cheap. A fixed group id would commit offsets
@@ -74,7 +88,9 @@ class RequestsMirror(threading.Thread):
                     if not prompt:
                         continue
                     submitted = evt.attrs.get("time")
-                    self._store.backfill_prompt_if_missing(
+                    target = (self._stores.for_event(evt) if self._stores
+                              else self._store)
+                    target.backfill_prompt_if_missing(
                         correlationid=corr, mode=mode, prompt=prompt,
                         submitted_utc=submitted,
                     )

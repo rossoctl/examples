@@ -189,6 +189,42 @@ restarts numbering at 1 and its rows overwrite the first turn's.
 `ER_CONSUMER_GROUP` must match the ScaledObject exactly or KEDA measures a group
 nobody joins.
 
+#### Phase 3 — per-user isolation
+
+Added in Phase 3 (`agentdocs/DESIGN_PHASE3.md`). Only the variables whose code is
+actually in the tree — §9's steps 1–4. Every one of them is off or single-tenant by
+default, so an existing deployment that upgrades and changes nothing behaves exactly
+as it did:
+
+| Env | Default | Effect |
+|---|---|---|
+| `EB_TENANCY_MODE` | `single` | `single` reproduces Phase 2: one topic pair, one store, no ownership checks. `multi` switches on per-user topics and requires an authenticated, registered caller |
+| `EB_TOPIC_PREFIX` | `kev1` | First component of every per-user topic name, `{prefix}-{userkey}-requests`. Unused in `single` mode |
+| `EB_USER_REGISTRY_PATH` | — | The approved-user registry (a ConfigMap, §2.5). **Required in `multi` mode, and an empty one denies everyone** — the other reading turns a missing file into an open door |
+| `EB_MAX_OPEN_STORES` | `64` | LRU ceiling on open per-user SQLite stores. Two WAL connections per tenant (main + `-wal` + `-shm`), so a 1024 soft descriptor limit bounds this near 150–200 tenants |
+| `ER_USERKEY` | — | Which tenant this runner serves. Stamped on every response so EventBridge can file it. **Required once `REQUEST_TOPIC` is not `requests`**; the runner refuses to start otherwise |
+| `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2) |
+| `ER_AGENT_NAME` | `default` | Fallback agent when neither the request nor the registry names one. `default` with no file on disk is Phase 2's argv exactly |
+
+Three notes on these. **`multi` mode is not yet isolation you should present as
+such.**
+Per-user stores *are* implemented (T5), so each tenant's sessions, responses and
+transcripts live in their own SQLite files and a read routes to the owning tenant's store
+— but nothing yet checks that the *caller* is that owner, because owner-scoped reads (T7)
+and transcript authentication (T8) are not in. So in `multi` mode the HTTP reads,
+`/continue` and `PUT /transcript` are still as open as Phase 2's. And even once they
+land, separate topics without Kafka ACLs are *organisation*, not isolation;
+`DESIGN_PHASE3.md` §3.6 and §10 are explicit about which claim each configuration earns.
+
+**`multi` also does not work end to end yet.** Until T6 neither consumer subscribes to
+the per-user topics, so no response is ever consumed: transcript pages stay empty, group
+counters never advance, and nothing is logged. Treat it as something to develop against,
+not to run.
+
+**Adding a user is an operator action.** EventBridge has no Kubernetes client and will
+not create topics, so a registry entry whose topics do not exist is a refusal, not an
+auto-provision.
+
 EventRunner does **not** hand its whole environment to the child process. It
 forwards a curated set — `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
 `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,

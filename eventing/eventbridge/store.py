@@ -455,6 +455,29 @@ class Store:
             for ev in self._subscribers.get(corr, []):
                 ev.set()
 
+    def close(self) -> None:
+        """Close both connections. Added for Phase 3 §6.1's LRU eviction.
+
+        Safe to call on a store that may be reopened later: a `Store` holds no state
+        above SQLite — every method opens a transaction and commits — so reconstructing
+        it against the same directory yields an equivalent object.
+
+        Wakes any SSE subscriber first. `StoreRegistry` will not evict a store that has
+        subscribers, so in that path this set is empty; it matters on shutdown, where a
+        viewer blocked on `Event.wait()` would otherwise hang until its own timeout
+        instead of noticing the process is going away.
+        """
+        with self._sub_lock:
+            for evs in self._subscribers.values():
+                for ev in evs:
+                    ev.set()
+        with self._lock:
+            for c in (self._r, self._s):
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001 - shutdown must not raise
+                    pass
+
 
 def _now_iso() -> str:
     import datetime as dt

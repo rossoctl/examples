@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import tomllib
 from dataclasses import dataclass, field
 
 from eventbridge import auth, ghauth
+from shared import tenancy
 
 
 @dataclass
@@ -77,7 +79,42 @@ class Cfg:
     # Enforcement rewrites persisted rows and raises a priority-5 notification, so
     # there has to be a way to watch the reject rate before turning it on.
     require_response_signature: bool = False
+
+    # ---- Phase 3 (DESIGN_PHASE3.md §8.1) ----
+
+    # §3.2 / §8.1 — `single` is Phase 2 behaviour: one topic pair, one store, no
+    # ownership checks. `multi` is everything in §3-§7. Default `single` so an existing
+    # deployment that upgrades and changes nothing behaves exactly as it did.
+    tenancy_mode: str = tenancy.SINGLE
+    # §3.1 — first component of every per-user topic name. Unused in `single` mode,
+    # where the configured request/response topics are returned verbatim.
+    topic_prefix: str = "kev1"
+    # §2.5 — the user registry ConfigMap. Empty in `multi` mode denies everyone, for
+    # the same reason Phase 2's empty allowed_users does: the other reading turns a
+    # missing file into an open door.
+    user_registry_path: str = ""
+    # §6.1 — LRU ceiling on open per-user SQLite stores. Two connections per tenant,
+    # each in WAL mode (main + `-wal` + `-shm`), so the default 1024 soft RLIMIT_NOFILE
+    # bounds this near 150-200 tenants; 64 leaves room for the Kafka sockets, the HTTP
+    # listener and the worker pool.
+    max_open_stores: int = 64
+
     ntfy: NtfyCfg = field(default_factory=NtfyCfg)
+
+    @property
+    def topics(self) -> tenancy.TopicSet:
+        """§3.2's helper, built from this config.
+
+        A property rather than a field so it cannot drift from `request_topic` /
+        `response_topic` after `load()` — the topic names and the set that derives from
+        them are one fact, and storing it twice is how they disagree.
+        """
+        return tenancy.TopicSet(
+            self.topic_prefix,
+            tenancy=self.tenancy_mode,
+            request_topic=self.request_topic,
+            response_topic=self.response_topic,
+        )
 
 
 def _root_tmpdir() -> str:
@@ -148,6 +185,36 @@ def load() -> Cfg:
     cfg.require_response_signature = (
         e("EB_REQUIRE_RESPONSE_SIGNATURE",
           "true" if cfg.require_response_signature else "false").lower() == "true")
+
+    # §8.1. Env only for the mode and the registry path: tenancy is a deployment-shape
+    # decision, and a committed config.toml that could flip it on is a way to get
+    # per-user isolation half-enabled by accident.
+    cfg.tenancy_mode = (e("EB_TENANCY_MODE", cfg.tenancy_mode) or "").strip().lower()
+    if cfg.tenancy_mode not in (tenancy.SINGLE, tenancy.MULTI):
+        raise SystemExit(
+            f"EB_TENANCY_MODE must be {tenancy.SINGLE!r} or {tenancy.MULTI!r}, "
+            f"got {cfg.tenancy_mode!r}. See DESIGN_PHASE3.md §8.1.")
+    cfg.topic_prefix = e("EB_TOPIC_PREFIX", cfg.topic_prefix)
+    # The prefix is the one component of a topic name `tenancy._slug` never sees, so it
+    # is validated here instead. A prefix containing `_` or `.` produces exactly the JMX
+    # metric-name collision that `_slug`'s docstring warns about (`a.b_c` and `a_b.c`
+    # flatten to the same metric and one silently overwrites the other), and a space or
+    # `/` is simply an illegal topic name.
+    if not re.fullmatch(r"[a-zA-Z0-9-]{1,32}", cfg.topic_prefix or ""):
+        raise SystemExit(
+            f"EB_TOPIC_PREFIX must be 1-32 of [a-zA-Z0-9-], got "
+            f"{cfg.topic_prefix!r}. `.` and `_` are excluded on purpose: Kafka's JMX "
+            f"metric names flatten both, so two topics differing only in which one they "
+            f"use silently share one metric. See DESIGN_PHASE3.md §3.1.")
+    cfg.user_registry_path = e("EB_USER_REGISTRY_PATH", cfg.user_registry_path)
+    # Readable refusal rather than a bare ValueError traceback, matching every other
+    # refusal on this startup path.
+    try:
+        cfg.max_open_stores = int(e("EB_MAX_OPEN_STORES", str(cfg.max_open_stores)))
+    except ValueError:
+        raise SystemExit(
+            f"EB_MAX_OPEN_STORES must be an integer, got "
+            f"{e('EB_MAX_OPEN_STORES')!r}") from None
 
     cfg.ntfy.enabled  = (e("NTFY_ENABLED", "true" if cfg.ntfy.enabled else "false").lower() == "true")
     cfg.ntfy.base_url = e("NTFY_BASE_URL", cfg.ntfy.base_url)

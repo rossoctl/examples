@@ -105,6 +105,23 @@ class Cfg:
     # verifier holding exactly one key accepts it; name it as soon as there are two.
     signing_kid: str = ""
 
+    # ---- Phase 3 (DESIGN_PHASE3.md) ----
+
+    # §3.3 — which tenant this runner serves. Stamped on every response as
+    # `ce_userkey`, which is what lets EventBridge file the response in the right
+    # store. Empty is single-tenant mode (the default, = Phase 2). Required once
+    # REQUEST_TOPIC is not the default: a runner that stamps no userkey produces
+    # events EventBridge cannot attribute, and a silent default here would route one
+    # user's output into another user's store. `load` enforces that, loudly.
+    userkey: str = ""
+
+    # §5.2 — where baked AgentSpecs live. A directory in the image, not a mount:
+    # an agent definition the agent itself could rewrite is not a policy.
+    agent_dir: str = "/etc/rossoctl/agents"
+    # §5.1 — the fallback agent when neither the request nor the registry names one.
+    # `default` with no file on disk is the built-in spec, i.e. Phase 2's argv.
+    agent_name: str = "default"
+
 
 def load() -> Cfg:
     e = os.environ.get
@@ -153,6 +170,21 @@ def load() -> Cfg:
     cfg.verify_key_path    = e("ER_VERIFY_KEY_PATH",  cfg.verify_key_path)
     cfg.verify_keyset_path = e("ER_VERIFY_KEYSET_PATH", cfg.verify_keyset_path)
     cfg.signing_kid        = e("ER_SIGNING_KID",      cfg.signing_kid)
+
+    # §3.3, §5.1-§5.2.
+    cfg.userkey    = (e("ER_USERKEY") or "").strip()
+    cfg.agent_dir  = e("ER_AGENT_DIR",  cfg.agent_dir)
+    cfg.agent_name = e("ER_AGENT_NAME", cfg.agent_name)
+    # A per-user runner is pointed at a per-user topic, so a non-default REQUEST_TOPIC
+    # with no ER_USERKEY means the deployment was rendered wrong. Refusing to start is
+    # the only safe direction: the alternative is responses EventBridge files into the
+    # `shared` store or drops, which looks exactly like an agent that never answered.
+    if cfg.request_topic != Cfg.request_topic and not cfg.userkey:
+        raise SystemExit(
+            f"ER_USERKEY is required when REQUEST_TOPIC is not {Cfg.request_topic!r} "
+            f"(got {cfg.request_topic!r}). A runner that stamps no userkey on its "
+            f"responses produces events EventBridge cannot attribute. "
+            f"See DESIGN_PHASE3.md §3.3.")
 
     base = e("TMPDIR", "/tmp").rstrip("/")
     cfg.tmpdir = f"{base}/rossoctl-keda1"

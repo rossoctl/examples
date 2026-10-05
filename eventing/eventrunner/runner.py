@@ -14,8 +14,11 @@ import sys
 import threading
 import time
 
+from eventrunner import agentspec
+from eventrunner.agentspec import AgentSpec
 from eventrunner.config import API_KEY_VARS, Cfg
 from eventrunner.emit import Emitter
+from shared import ce
 
 # Env vars forwarded to the `claude` subprocess. The child does NOT inherit
 # our full environment — only these keys pass through when they are set on
@@ -213,7 +216,8 @@ def is_hook_frame(frame) -> bool:
 
 
 def build_cmd(cfg: Cfg, event, payload: dict, *,
-              resume_target: str | None = None) -> list[str]:
+              resume_target: str | None = None,
+              spec: AgentSpec | None = None) -> list[str]:
     """Assemble the claude argv for one turn.
 
     `resume_target` overrides what `--resume` gets. Phase 0 always passed the
@@ -221,23 +225,63 @@ def build_cmd(cfg: Cfg, event, payload: dict, *,
     Phase 1 passes an absolute transcript path when it has one, which is what
     makes `/continue` survive a scale-to-zero (§16 Gap B, verified by
     scripts/verify_resume_by_path.py).
+
+    Phase 3 §5.5: `spec` is an `AgentSpec` carrying the tool policy, system prompt and
+    model. `None` — and the built-in `default` spec — produce **byte-identical argv to
+    Phase 2**, which is what keeps the e2e path and the existing tests unchanged;
+    `tests/test_agentspec.py` asserts that equality rather than trusting it.
+
+    Precedence between the request and the spec is deliberate and differs by field:
+
+    * `max_turns` and `model` — the **request wins** when it names one. Both are
+      per-turn parameters a caller has always been able to send, and a spec silently
+      overriding them would break Phase 0's wire contract.
+    * the tool policy, permission mode and system prompt — **only the spec**. These are
+      the sandbox (§7.4), and a request that could widen them would be a request that
+      can escape them, which is the whole control inverted.
+
+    The prompt goes through `argv`, never a shell: `Popen` with a list and no
+    `shell=True` is what makes §7.4's attacker-influenced prompt a prompt-injection
+    problem rather than also a command-injection one. The obvious "improvement" of
+    building a command string would silently reintroduce it.
     """
+    spec = spec or AgentSpec()
     session = event["sessionuuid"]
     mode = event.get("mode", "start")
     prompt = payload.get("prompt", "")
+    # `is not None`, not `or`: `max_turns: 0` is nonsensical input, and with `or` it
+    # silently became the spec's value while the spec path REJECTS zero
+    # (`test_a_nonsensical_max_turns_is_refused`). Two paths disagreeing about the same
+    # bad input is worse than either answer — the HTTP boundary is where it should be
+    # refused, and until then both paths at least agree it is what the caller asked for.
+    req_turns = payload.get("max_turns")
+    max_turns = spec.max_turns if req_turns is None else req_turns
     cmd = [
         cfg.claude_bin, "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--max-turns", str(payload.get("max_turns", 3)),
-        "--permission-mode", "acceptEdits",
+        "--max-turns", str(max_turns),
+        "--permission-mode", spec.permission_mode,
     ]
     if mode == "start":
         cmd += ["--session-id", session]
     else:
         cmd += ["--resume", resume_target or session]
-    if model := payload.get("model"):
+    if model := (payload.get("model") or spec.model):
         cmd += ["--model", model]
+    # Appended after the Phase 2 flags, so the default spec's argv is a prefix-equal
+    # match rather than merely an equivalent set — easier to assert and to eyeball in a
+    # log line.
+    if spec.allowed_tools:
+        cmd += ["--allowedTools", ",".join(spec.allowed_tools)]
+    if spec.disallowed_tools:
+        cmd += ["--disallowedTools", ",".join(spec.disallowed_tools)]
+    if spec.system_prompt:
+        cmd += ["--append-system-prompt", spec.system_prompt]
+    if spec.settings_path:
+        cmd += ["--settings", spec.settings_path]
+    if spec.mcp_config_path:
+        cmd += ["--mcp-config", spec.mcp_config_path]
     return cmd
 
 
@@ -291,6 +335,27 @@ def run_agent(cfg: Cfg, emitter: Emitter, event, *, transcripts=None) -> None:
 
     started = time.monotonic()
 
+    # §5.1 resolution order, most specific first. A request naming an agent this runner
+    # does not have is an ERROR EVENT, never a silent fallback to `default`: running a
+    # different agent than the one asked for means a policy the caller believes applied
+    # did not, which is worse than not running at all.
+    agent_name = agentspec.resolve_name(event.get(ce.EXT_AGENT), cfg.agent_name)
+    try:
+        spec = agentspec.load(cfg.agent_dir, agent_name)
+    except agentspec.SpecError as e:
+        print(f"[eventrunner] {corr}: {e}", file=sys.stderr, flush=True)
+        emitter.emit(correlationid=corr, sessionuuid=session,
+                     sequence=emitter.next_seq(corr), phase="error", final=True,
+                     data={"error": f"agent spec unavailable: {e}",
+                           "agent": agent_name},
+                     causationid=causation, groupid=groupid)
+        return
+    if not spec.is_default:
+        print(f"[eventrunner] {corr}: agent={spec.name} "
+              f"permission_mode={spec.permission_mode} "
+              f"allowed={list(spec.allowed_tools)} "
+              f"disallowed={list(spec.disallowed_tools)}", flush=True)
+
     if cfg.mock_claude:
         _run_mock(emitter, corr, session, payload, causation=causation,
                   groupid=groupid, delay=_mock_delay(cfg))
@@ -308,7 +373,7 @@ def run_agent(cfg: Cfg, emitter: Emitter, event, *, transcripts=None) -> None:
                   f"pod that is gone — DESIGN_PHASE1.md §16 Gap B)",
                   file=sys.stderr, flush=True)
 
-    cmd = build_cmd(cfg, event, payload, resume_target=resume_target)
+    cmd = build_cmd(cfg, event, payload, resume_target=resume_target, spec=spec)
     try:
         proc = subprocess.Popen(cmd, cwd=str(workdir),
                                 stdin=subprocess.DEVNULL,
