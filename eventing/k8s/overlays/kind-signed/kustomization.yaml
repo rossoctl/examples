@@ -52,12 +52,39 @@ patches:
       - op: replace
         path: /data/EB_SIGNING_KID
         value: eb-01
-      # Seed paths point at the Secret mount. `add`, not `replace`: these keys are
-      # deliberately absent from the base ConfigMap (configmap.yaml says seed paths
-      # "belong in the Deployment beside the volume"), so there is nothing to replace.
+      # Seed paths are NOT here. `configmap.yaml` says they "name Secret mounts and
+      # belong in the Deployment beside the volume", so they are set as container `env`
+      # entries on each Deployment below. An earlier revision of this overlay put them
+      # here and quoted that rule immediately before breaking it — no leak, since the
+      # value is a path, but a rule the repo states and a patch cites should not be a
+      # rule the patch breaks. The §14.1 digest covers the Deployments too, so nothing
+      # is lost by keeping them there.
+
+  # The seed paths, beside the volume that supplies the seed — which is the whole point
+  # of the location rule. `env` rather than the ConfigMap also keeps
+  # `test_manifests.py`'s Secret-vs-ConfigMap assertions able to mean what they say,
+  # including the Phase 3 tuple in #883 that is scoped to seed-path variables.
+  - target:
+      kind: Deployment
+      name: eventbridge
+    patch: |-
+      # `env` does not exist on the base container (only `envFrom`), so this adds the
+      # whole list rather than appending to it. A trailing-slash `env/-` op would fail
+      # with "path does not exist" at render time.
       - op: add
-        path: /data/ER_SIGNING_KEY_PATH
-        value: /etc/ce-signing/seed.hex
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: EB_SIGNING_KEY_PATH
+            value: /etc/ce-signing/seed.hex
+  - target:
+      kind: Deployment
+      name: eventrunner
+    patch: |-
+      # `env` does not exist on the base container (only `envFrom`), so this adds the
+      # whole list rather than appending to it. A trailing-slash `env/-` op would fail
+      # with "path does not exist" at render time.
       - op: add
-        path: /data/EB_SIGNING_KEY_PATH
-        value: /etc/ce-signing/seed.hex
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: ER_SIGNING_KEY_PATH
+            value: /etc/ce-signing/seed.hex

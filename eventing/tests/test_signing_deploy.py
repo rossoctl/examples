@@ -229,3 +229,93 @@ def test_dry_run_applies_nothing(tmp_path):
     _keydir(tmp_path)
     k, c = _apply(str(tmp_path), dry_run=True)
     assert c.failed == 0 and k.applied == []
+
+
+# ---- the seed must DERIVE the approved public key ------------------------
+#
+# Review finding on #884: every other check passes on a pair that does not agree, which
+# is the one divergence producing the cluster this validation exists to prevent — pods
+# start (both volumes are `optional: true`), enforcement is on, the service signs with a
+# key nobody approved, and every event is refused with nothing local to look at.
+
+
+@pytest.mark.parametrize("kid", ["eb-01", "runner-01"])
+def test_a_seed_that_does_not_match_the_approved_key_is_refused(tmp_path, kid):
+    """The likeliest real case is not hand-editing: an `agents.json` copied from a
+    teammate or a previous cluster while the seeds on disk are local."""
+    _keydir(tmp_path)
+    # Replace one seed, leaving agents.json alone — so the kid is still in the keyset
+    # and the file still exists, which is all the other checks look at.
+    other = G.generate(1)["eb-01"]
+    (tmp_path / kid / "seed.hex").write_text(other.hex() + "\n")
+
+    k, c = _apply(str(tmp_path))
+    assert c.failed == 1, "a mismatched seed/keyset pair was accepted"
+    assert not any(m["kind"] == "ConfigMap" for m in k.applied), \
+        "the keyset was applied despite a mismatched pair"
+
+
+def test_the_mismatch_refusal_names_both_fingerprints(tmp_path, capsys):
+    """An operator has to be able to tell which half is wrong, so the message carries a
+    prefix of each key and names the two remedies."""
+    _keydir(tmp_path)
+    (tmp_path / "eb-01" / "seed.hex").write_text(G.generate(1)["eb-01"].hex() + "\n")
+    _apply(str(tmp_path))
+    out = capsys.readouterr().out
+    assert "derives" in out and "approves" in out
+    assert "gen_signing_keys.py" in out, "the message should name the fix"
+
+
+def test_a_corrupt_seed_file_is_refused_rather_than_crashing(tmp_path):
+    """`load_seed` raises on a non-hex or wrong-length file; that must become a named
+    check failure, not a traceback out of the deploy script."""
+    _keydir(tmp_path)
+    (tmp_path / "eb-01" / "seed.hex").write_text("not-a-seed\n")
+    k, c = _apply(str(tmp_path))
+    assert c.failed == 1 and k.applied == []
+
+
+def test_a_matching_directory_is_still_accepted(tmp_path):
+    """The gate must not reject what it should allow — the check is an equality, and an
+    equality test that always fails is as useless as one that never does."""
+    _keydir(tmp_path, runners=2)
+    k, c = _apply(str(tmp_path))
+    assert c.failed == 0
+    assert len(k.applied) == 3  # two Secrets + the keyset ConfigMap
+
+
+# ---- write_seeds is all-or-nothing --------------------------------------
+
+
+def test_a_partial_rotation_writes_nothing_at_all(tmp_path):
+    """Review finding on #884: `write_seeds` wrote kid-by-kid and raised mid-loop, so if
+    the FIRST kid in sorted order was missing and a later one present, the first got a
+    brand-new seed while `agents.json` — rewritten by the caller, afterwards — kept the
+    old public key for it. That is the state the module docstring promises cannot
+    happen: "the keyset cannot disagree with the keys it is supposed to authorize"."""
+    keys = _keydir(tmp_path, runners=1)
+    before = (tmp_path / "agents.json").read_text()
+    eb_seed = tmp_path / "eb-01" / "seed.hex"
+    original_eb = eb_seed.read_text()
+    eb_seed.unlink()                      # first in sorted order; runner-01 survives
+
+    with pytest.raises(SystemExit) as e:
+        G.write_seeds(tmp_path, keys)
+    assert "already exist" in str(e.value)
+    assert "Nothing was written" in str(e.value)
+
+    # The refusal left the directory exactly as it was: no new seed for eb-01, so
+    # agents.json cannot have drifted away from what is on disk.
+    assert not eb_seed.exists(), "a new seed was written despite the refusal"
+    assert (tmp_path / "agents.json").read_text() == before
+    assert original_eb  # the original was readable before we removed it
+
+
+def test_force_still_rotates_every_key(tmp_path):
+    """The pre-check must not make `--force` a no-op."""
+    keys = _keydir(tmp_path, runners=1)
+    first = (tmp_path / "eb-01" / "seed.hex").read_text()
+    fresh = G.generate(1)
+    G.write_seeds(tmp_path, fresh, force=True)
+    assert (tmp_path / "eb-01" / "seed.hex").read_text() != first
+    assert keys  # the originals existed; the point is force overwrote them

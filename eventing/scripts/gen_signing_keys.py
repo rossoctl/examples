@@ -84,18 +84,33 @@ def write_seeds(out: pathlib.Path, seeds: dict[str, bytes], *,
     """
     out.mkdir(parents=True, exist_ok=True)
     out.chmod(0o700)
+
+    # Check EVERY target before writing ANY of them. Raising mid-loop would leave a new
+    # seed on disk for one kid while `agents.json` — written by the caller, after this
+    # returns — still holds the old public key for it. That is precisely the state this
+    # module's docstring promises cannot happen ("the keyset cannot disagree with the
+    # keys it is supposed to authorize"), and until k8s_deploy.py grew its
+    # seed-derives-the-approved-key check, nothing downstream could detect it.
+    #
+    # Reachable whenever the FIRST kid in sorted order is missing and a later one is
+    # present — a partial rotation, or a restored backup.
+    if not force:
+        clashes = [out / kid / SEED_FILE for kid in sorted(seeds)
+                   if (out / kid / SEED_FILE).exists()]
+        if clashes:
+            raise SystemExit(
+                f"[{PREFIX}] {', '.join(str(p) for p in clashes)} already exist — "
+                f"refusing to overwrite keys that may already be deployed and approved. "
+                f"Nothing was written. Pass --force if you mean to rotate, and remember "
+                f"rotation means redeploying the keyset and restarting both services "
+                f"(shared/keyset.py: no live reload, on purpose).")
+
     written = []
     for kid, seed in sorted(seeds.items()):
         d = out / kid
         d.mkdir(exist_ok=True)
         d.chmod(0o700)
         p = d / SEED_FILE
-        if p.exists() and not force:
-            raise SystemExit(
-                f"[{PREFIX}] {p} exists — refusing to overwrite a key that may already "
-                f"be deployed and approved. Pass --force if you mean to rotate, and "
-                f"remember rotation means redeploying the keyset and restarting both "
-                f"services (shared/keyset.py: no live reload, on purpose).")
         # Create at 0600 before writing, not after: a chmod afterwards leaves a window
         # in which the seed exists world-readable.
         p.touch(mode=0o600, exist_ok=True)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deploy in the §13 order, with the public URL as a hard gate. Tasks T4.2, T4.3.
 
-  0. Preflight (§12 checks 1-8, 10-12). Abort on any failure.
+  0. Preflight (§12 checks 1-8, 10-13). Abort on any failure.
   1. Namespace.
   2. Topics — in ns `kafka`, NOT the target namespace (Finding 1).
   3. The overlay: EventBridge + Service + Route + EventRunner + ScaledObject.
@@ -50,7 +50,7 @@ from k8slib import Kubectl, condition_is, condition_reason, dig, wait_for  # noq
 from proclib import Checks, die  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from shared import keyset  # noqa: E402
+from shared import keyset, signing  # noqa: E402
 
 PREFIX = "deploy"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -296,6 +296,33 @@ def ensure_signing_material(k: Kubectl, c: Checks, ns: str, keydir: str | None, 
                    f"unapproved kid has every event refused by the other side")
             return
         seed_hex = seed_file.read_text().strip()
+        # The check the other four cannot make: that this seed DERIVES the public key the
+        # keyset approves for its kid. A kid present in both files with a mismatched pair
+        # passes every check above and produces exactly the cluster this function exists
+        # to prevent — pods start (both volumes are `optional: true`), enforcement is on,
+        # the service signs with a key nobody approved, and every event is refused with
+        # no local symptom.
+        #
+        # Reachable without hand-editing: an `agents.json` copied from a teammate or a
+        # previous cluster while the seeds on disk are local, a restored backup, or a
+        # partial regenerate.
+        try:
+            seed = signing.load_seed(str(seed_file))
+        except Exception as e:  # noqa: BLE001 - any decode problem is the same answer
+            c.fail(f"seed for kid {kid!r} is a usable Ed25519 seed", f"{seed_file}: {e}")
+            return
+        derived = signing.public_key(seed)
+        approved = ks.select(kid)
+        if derived != approved:
+            c.fail(
+                f"the seed for kid {kid!r} matches the approved public key",
+                f"{seed_file} derives {derived.hex()[:16]}… but {keyset_path} approves "
+                f"{approved.hex()[:16]}… for {kid!r}. Deploying this pair starts both "
+                f"services, signs with an unapproved key and has every event refused, "
+                f"with nothing local to look at. Regenerate the pair with "
+                f"`python3 scripts/gen_signing_keys.py --out {d} --force`, or restore "
+                f"the agents.json that goes with these seeds.")
+            return
         manifest = {
             "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
             "metadata": {"name": secret_name, "namespace": ns,
@@ -573,7 +600,7 @@ def main(argv=None) -> int:
         return c.summary()
 
     if not args.skip_preflight:
-        c.section("step 0: preflight (§12 checks 1-8, 10-12)")
+        c.section("step 0: preflight (§12 checks 1-8, 10-13)")
         skip = {int(s) for s in args.skip.split(",") if s.strip()}
         k8s_preflight.run_pre(k8s_preflight.Preflight(k, c, args), skip)
         if c.failed:
