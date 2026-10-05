@@ -530,3 +530,124 @@ def test_a_broken_index_is_not_reported_as_an_exhausted_id_space():
 
     with pytest.raises(sqlite3.OperationalError):
         Minter(index=Broken()).mint(userkey=UK)
+
+
+# ---- round 3: the three fixes that shipped without a regression test ------
+#
+# The #883 approval noted that reverting `agentspec`'s try/except, `claim`'s tombstone
+# check or `registry`'s `validate_name` left all 858 tests passing — so three of the six
+# fixes in 258da7a were invisible to the suite. The standard this PR has applied since
+# 6ebdd80 is "every fix has a regression test, verified by reverting its fix", and it
+# had been applied to half that commit. These close the gap.
+
+
+@pytest.mark.parametrize("field,value", [
+    ("timeout_s", '"900s"'),
+    ("max_output_bytes", '"4MB"'),
+    ("max_events", '"lots"'),
+])
+def test_a_non_numeric_limit_raises_specerror_not_valueerror(tmp_path, field, value):
+    """`run_agent` catches only `SpecError`, so a bare `ValueError` from these three
+    conversions propagated out of it instead of becoming the `phase=error` event §5.1
+    promises. `max_turns` is wrapped for exactly this reason; `[limits]` was the one
+    block in `parse` that escaped the module's own stated contract."""
+    from eventrunner import agentspec
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "agent.toml").write_text(f"[limits]\n{field} = {value}\n")
+    with pytest.raises(agentspec.SpecError, match="limits must be numbers"):
+        agentspec.load(str(tmp_path), "a")
+
+
+@pytest.mark.parametrize("block,match", [
+    ("[limits]\ntimeout_s = -5\n", "timeout_s must be >= 0"),
+    ("[limits]\nmax_output_bytes = -1\n", "max_output_bytes must be >= 0"),
+    ("[limits]\nmax_events = 0\n", "max_events must be >= 1"),
+])
+def test_a_nonsensical_limit_range_is_refused(tmp_path, block, match):
+    """The review left this as a noted gap, since `Limits` is documented inert. Closed
+    anyway: a negative deadline is nonsensical whether or not anything reads it yet, and
+    whoever wires up the `Popen` wrapper should inherit a value they can trust rather
+    than re-validate. `max_events = 0` is the interesting one — a run that may emit no
+    events cannot report its own result."""
+    from eventrunner import agentspec
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "agent.toml").write_text(block)
+    with pytest.raises(agentspec.SpecError, match=match):
+        agentspec.load(str(tmp_path), "a")
+
+
+def test_the_documented_sentinels_still_load(tmp_path):
+    """`0` means "no spec-imposed deadline"/"unbounded" per the docstring, so the range
+    check must not reject the documented defaults."""
+    from eventrunner import agentspec
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "agent.toml").write_text("[limits]\ntimeout_s = 0\nmax_output_bytes = 0\n")
+    spec = agentspec.load(str(tmp_path), "a")
+    assert spec.limits.timeout_s == 0.0
+    assert spec.limits.max_output_bytes == 0
+    assert spec.limits.max_events == 2000
+
+
+def test_a_non_table_limits_block_is_refused(tmp_path):
+    from eventrunner import agentspec
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "agent.toml").write_text('limits = "nope"\n')
+    with pytest.raises(agentspec.SpecError, match="limits must be a table"):
+        agentspec.load(str(tmp_path), "a")
+
+
+def test_a_tombstoned_correlation_cannot_be_reclaimed_by_anyone(tmp_path):
+    """`forget` clears `userkey` to NULL, so `claim(corr, None)` hit `None == None` and
+    returned as an idempotent re-claim — contradicting the guarantee `forget` makes, that
+    the id is reserved forever because a reissue derives the same unsalted `sessionuuid`.
+
+    Unreachable from `Minter.mint`, which checks `exists()` first; reachable as soon as a
+    `correlationid` arrives from outside, which §7's triggers bring.
+    """
+    from eventbridge.owner_index import Collision, OwnerIndex
+    owners = OwnerIndex(tmp_path / "eventbridge")
+    owners.claim("brave-otter-0001", UK)
+    owners.forget("brave-otter-0001")
+
+    # The NULL owner is the case `row[0] == userkey` got wrong.
+    with pytest.raises(Collision, match="tombstoned"):
+        owners.claim("brave-otter-0001", None)
+    # A tenant failed correctly before, but must keep failing for the RIGHT reason: the
+    # message should say "tombstoned", not "already owned by (single-tenant)".
+    with pytest.raises(Collision, match="tombstoned"):
+        owners.claim("brave-otter-0001", OTHER)
+    assert owners.is_tombstoned("brave-otter-0001")
+
+
+def test_a_registry_agent_name_is_validated_at_startup():
+    """`agent` was the only field `parse` accepted unchecked, in a function whose
+    docstring promises every inconsistency is a refusal. It reaches `ce_agent` via
+    `by_userkey(...).agent` on a path that never sees `validate_name`, so a typo meant an
+    asynchronous `phase=error` on EVERY request from that user — the failure mode the
+    request path was moved away from in `6ebdd80`."""
+    raw = json.dumps({"version": 1, "users": [
+        {"issuer": "github", "userid": "alice", "agent": "Not A Label"}]})
+    with pytest.raises(registry.RegistryError, match="DNS-1123"):
+        registry.parse(raw)
+
+
+@pytest.mark.parametrize("bad", ["../../etc", "a/b", "x" * 64, "UPPER"])
+def test_every_invalid_registry_agent_shape_is_refused(bad):
+    raw = json.dumps({"version": 1, "users": [
+        {"issuer": "github", "userid": "alice", "agent": bad}]})
+    with pytest.raises(registry.RegistryError):
+        registry.parse(raw)
+
+
+def test_a_valid_registry_agent_is_accepted_and_an_absent_one_falls_through():
+    """The gate must not reject what it should allow: a good name loads, and an omitted
+    `agent` stays empty so the runner's own `ER_AGENT_NAME` applies."""
+    r = registry.parse(json.dumps({"version": 1, "users": [
+        {"issuer": "github", "userid": "alice", "agent": "triager"},
+        {"issuer": "github", "userid": "bob"}]}))
+    assert r.lookup("github", "alice").agent == "triager"
+    assert r.lookup("github", "bob").agent == ""

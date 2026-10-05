@@ -90,6 +90,9 @@ class Limits:
 
     Said plainly because the alternative is an operator writing `timeout_s = 900`,
     getting no error, and believing there is a deadline.
+
+    Types AND ranges are validated at load even though nothing reads the values yet, so
+    the code that eventually applies them inherits a value it can trust.
     """
     timeout_s: float = 0.0            # 0 = no spec-imposed deadline
     max_output_bytes: int = 0         # 0 = unbounded by the spec
@@ -259,6 +262,22 @@ def parse(raw: str, *, name: str, base_dir: pathlib.Path | None = None) -> Agent
         )
     except (TypeError, ValueError) as e:
         raise SpecError(f"agent {name!r}: limits must be numbers: {e}") from None
+    # Ranges, not just types. The review left this as a noted gap on the grounds that
+    # `Limits` is documented inert — but a negative deadline or a zero event budget is
+    # nonsensical input whether or not anything reads it yet, and the module's own
+    # standard is that a policy which cannot be understood fails to load. Rejecting now
+    # also means the code that eventually wraps `Popen` inherits a value it can trust
+    # rather than having to re-validate.
+    if limits.timeout_s < 0:
+        raise SpecError(f"agent {name!r}: limits.timeout_s must be >= 0 "
+                        f"(0 means no spec-imposed deadline), got {limits.timeout_s}")
+    if limits.max_output_bytes < 0:
+        raise SpecError(f"agent {name!r}: limits.max_output_bytes must be >= 0 "
+                        f"(0 means unbounded), got {limits.max_output_bytes}")
+    if limits.max_events < 1:
+        raise SpecError(f"agent {name!r}: limits.max_events must be >= 1 — a run that "
+                        f"may emit no events cannot report its own result, got "
+                        f"{limits.max_events}")
 
     return AgentSpec(
         name=name,
