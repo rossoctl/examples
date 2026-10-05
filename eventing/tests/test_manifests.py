@@ -20,9 +20,13 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 K8S = ROOT / "k8s"
+# `kind-signed` (#884) is included deliberately: it was absent when that PR added the
+# overlay, so every assertion in this file silently skipped the one overlay that turns
+# signing on — including the seed-path rule the PR exists to respect.
 OVERLAYS = {"test": K8S / "overlays" / "test",
             "kind": K8S / "overlays" / "kind",
-            "demo": K8S / "overlays" / "demo"}
+            "demo": K8S / "overlays" / "demo",
+            "kind-signed": K8S / "overlays" / "kind-signed"}
 
 _HAVE_KUBECTL = shutil.which("kubectl") is not None
 
@@ -166,11 +170,27 @@ def test_no_credential_is_ever_rendered_into_a_manifest():
 #: rather than being remembered afterwards. `test_every_phase3_variable_is_classified`
 #: deliberately does NOT require these to be read, which is why it only asserts the
 #: ConfigMap side against live code.
-SECRET_PATH_VARS = (
+SECRET_VALUE_VARS = (
     "EB_NTFY_TOPIC_SECRET_PATH",
     "EB_CAPABILITY_SECRET_PATH",
     "EB_WEBHOOK_SECRETS_PATH",
 )
+
+#: The signing seed paths, from #884. Same §5 rule, different obligation — and the
+#: distinction is the one that PR had to settle: these hold a **mount point**, not key
+#: material, so a literal value is correct. What they must not do is come from the
+#: committed ConfigMap: `configmap.yaml` says seed paths "name Secret mounts and belong
+#: in the Deployment beside the volume", and #884 moved them to a container `env` entry
+#: for exactly that reason after an earlier revision put them in `eventing-config` and
+#: quoted the rule immediately before breaking it.
+SEED_PATH_VARS = (
+    "ER_SIGNING_KEY_PATH",
+    "EB_SIGNING_KEY_PATH",
+)
+
+#: Both groups obey "never from `config.toml`", which is what
+#: `test_secret_path_variables_are_never_set_from_the_committed_config` checks.
+SECRET_PATH_VARS = SECRET_VALUE_VARS + SEED_PATH_VARS
 
 #: The other side of the same rule: these record what an operator approved and grant
 #: nothing, so a ConfigMap (or an image path) is correct and a Secret would be cargo
@@ -199,10 +219,21 @@ def test_secret_path_variables_are_never_set_from_the_committed_config():
 
 @needs_kubectl
 def test_no_phase3_secret_is_inlined_into_a_manifest():
-    """The §8.3 rule, checked where it would actually leak: rendered output."""
+    """The §8.3 rule, checked where it would actually leak: rendered output.
+
+    **A path naming a secret is not a secret.** `*_SIGNING_KEY_PATH` holds
+    `/etc/ce-signing/seed.hex` — a mount point, not key material — and #884 deliberately
+    sets it as a container `env` entry so it sits *beside the volume that supplies the
+    seed*, which is what `configmap.yaml` asks for. So a literal value is correct for
+    those, and the rule they must obey is a different one: the **seed itself** must never
+    appear, and the path must not be set from the committed ConfigMap.
+
+    The variables whose *value* is key material — none of them read yet, see the note on
+    SECRET_PATH_VARS — must have no literal value anywhere.
+    """
     for overlay in OVERLAYS:
         rendered = render(overlay)
-        for var in SECRET_PATH_VARS:
+        for var in SECRET_VALUE_VARS:
             # Referencing the variable is fine; giving it a literal sibling value is
             # not. A `secretKeyRef` has no `value:` on the same key.
             #
@@ -213,6 +244,18 @@ def test_no_phase3_secret_is_inlined_into_a_manifest():
             inlined = re.search(rf"name:\s*{re.escape(var)}\s*\n\s*value:", rendered)
             assert f"{var}:" not in rendered and not inlined, \
                 f"{overlay} appears to inline {var} rather than mounting a Secret"
+        # The seed-path variables: a literal value is fine, a ConfigMap key is not.
+        # `f"{var}:"` matches the ConfigMap `data:` spelling (`VAR: value`) but not the
+        # env-entry spelling (`- name: VAR` / `value: …`), which is the distinction.
+        for var in SEED_PATH_VARS:
+            assert f"{var}:" not in rendered, \
+                (f"{overlay} sets {var} as a ConfigMap key; `configmap.yaml` says seed "
+                 f"paths name Secret mounts and belong in the Deployment beside the "
+                 f"volume (see #884)")
+    # And no seed material, by any route, in any overlay.
+    for overlay in OVERLAYS:
+        rendered = render(overlay)
+        assert "seed.hex:" not in rendered, f"{overlay} may inline a seed"
 
 
 #: Variables that pre-date §8.3 and are therefore out of its scope. Retro-classifying all
