@@ -5,6 +5,9 @@ Scope: everything needed to deliver the talk — the abstract as submitted, what
 committed to show, the gap between that and the code, the plan to close it, and the
 slide/demo shape that fits 30 minutes.
 
+**If you are picking this up to do the work:** §5 is the MVP — four items, ~two days,
+and the honest talk they buy. §4 is the full plan it was cut from.
+
 This file is the reference other analyses should cite. It is deliberately specific
 about what is **not** done, because the talk's own thesis is that unchecked control
 claims are where compositions leak — and `DESIGN_PHASE2.md` §8 is the record of this
@@ -255,6 +258,11 @@ visual demo beat. See W3 below.
 Ordered by ratio of talk-value to effort. W1–W3 are the ones that change what you can
 honestly say on stage; W4–W6 are polish.
 
+**This is the full plan, kept for the reasoning.** The subset actually proposed for the
+talk is **§5's M1-M4**, which cuts W6 entirely, defers half of W4, and replaces W3 with a
+substitution rather than a build. Read this section for *why* each item matters; read §5
+for what to do.
+
 ### W1 — Fix #885 and #888 (highest value, smallest change)
 
 These are the difference between a security demo and security theater, and a sharp
@@ -292,13 +300,29 @@ repository's own precedent says unit tests do not catch this class of bug.
 Exit criteria: one command drives zero → signed wake → verified completion → forged
 event refused → zero, with assertions and timings.
 
-### W3 — Build the egress block (D3)
+### W3 — The egress block (D3) — and why the obvious MVP does not work
 
 The only promised demo beat with zero implementation, and the most visceral one.
 
-Minimum viable, no SPIRE needed: a `NetworkPolicy` on the EventRunner namespace with a
-DNS + broker + model-endpoint egress allowlist, then have the demo agent attempt a
-call outside it and show the block.
+**The obvious MVP does not work, and the way it fails is on-theme.** The first version of
+this section said: add a `NetworkPolicy` to the EventRunner namespace with a DNS + broker
++ model-endpoint egress allowlist, no SPIRE needed. That recommendation was made without
+checking the CNI. `k8s/kind/kind-cluster.yaml` creates a default Kind cluster, and Kind's
+default CNI is **kindnetd, which does not implement NetworkPolicy**: the object is
+accepted by the API server, `kubectl get networkpolicy` shows it, and **nothing is
+enforced**. The demo would have shown a policy that appeared to work and blocked nothing
+— which is precisely the class of failure this talk is about, reached by skipping §8.5.1
+("which code path, by name?") on a piece of infrastructure rather than on code.
+
+So the real options are:
+
+| Option | What it costs | Verdict |
+|---|---|---|
+| Swap Kind's CNI for Calico or Cilium | `disableDefaultCNI: true`, install a CNI, then re-verify the whole Phase 1 stack on it — Strimzi, KEDA, ingress-nginx, the scale-to-zero timings | ❌ Too much risk this close to the talk, for one demo beat |
+| Demo the egress block on **OpenShift** (ykt1), which enforces NetworkPolicy natively | A second cluster in the demo, on VPN, and §"Measured" already warns Kind and cluster timings are not comparable | 🟡 Viable as a **separately recorded clip**, labelled as a different cluster |
+| **Cut D3 and substitute the #888 asymmetry** | A few hours, no new infrastructure | ✅ **Recommended — see M3** |
+
+If the beat is built at all, two things still apply:
 
 - **Make the failure legible.** A `NetworkPolicy` denial is a connection timeout, which
   on stage is indistinguishable from a slow network. Either surface the agent's own error
@@ -308,11 +332,13 @@ call outside it and show the block.
   "trust-scope drift" seam the abstract says is the *problem*. Demoing the static version
   and naming the drift is honest and still makes the point. Claiming it is scope-aware at
   wake time would not be.
-- If Option B lands later, the same beat upgrades to sidecar-reading-SVID without
-  changing the demo script.
 
-Exit criteria: a wrong-scope call is blocked, visibly, within a few seconds, in under
-60 s of demo time.
+If Option B (§3) lands later, the same beat upgrades to sidecar-reading-SVID without
+changing the demo script.
+
+Exit criteria, if built: a wrong-scope call is blocked, visibly, within a few seconds, in
+under 60 s of demo time, **on a CNI that enforces policy** — verified by checking that a
+deliberately-denied call actually fails before relying on it.
 
 ### W4 — Fix #887 and #889
 
@@ -354,13 +380,150 @@ pick one for the recorded numbers and say which.
 
 ---
 
-## 5. The 30-minute shape
+## 5. The MVP cut: M1-M4
+
+§4 is the full plan. This is the subset that makes the talk **honest and demo-backed**,
+which is a smaller target than finishing Phase 2. Roughly **two days of focused work.**
+
+The line the MVP buys:
+
+> **Three seams delivered and demo-backed. One named as the upgrade path, with its
+> obstacles.**
+
+That is achievable. Four seams delivered is not, and attempting it is what puts the talk
+at risk.
+
+### M1 — Fix #888, then #885  *(~0.5 day)*
+
+Both call sites were read; both are small and localised.
+
+**#888** — `kafka_in.py:93`. The decision is unreachable without a keyset:
+
+```python
+ok, why = True, "not checked"
+if self._keyset is not None:        # <- `require` is never consulted
+```
+
+Fix: when `require_signature` is on and `keyset is None`, fail closed. **The startup
+banner matters as much as the behaviour** — `__main__.py:76` prints
+`response verification OFF` in exactly that configuration, so an operator who asked for
+enforcement is told it is off and refuses nothing. The silent wrong state is the bug;
+the missing refusal is only half of it.
+
+**#885** — `kafka_in.py:136` routes on `is_group_event(evt)`, the **original** event, so
+the rejection rewrite reaches `on_group_event` → `complete_group()`. The rewrite
+deliberately preserves `type` and `groupid` for forensics (`insert_response` derives both
+`data_json` and `raw_json` from the one dict), so the fix is not to strip them: it is to
+not route a **rejected** event to the group handler at all. The forensic record already
+lives under `data["rejected"]`, so nothing is lost.
+
+Tests must **assert the outcome, not the verdict** — §8.6's rule.
+`response_decision` returning `False` is not the same as the batch not completing, and
+that gap *is* #885.
+
+**Out of scope for the MVP:** verifying the group mirror's replay path. It is the right
+fix, but it changes restart behaviour for existing unsigned topic data, so it needs a
+flag — and it does not appear in the demo.
+
+Exit criteria: a forged `group.completed` with enforcement on does **not** complete the
+batch and does **not** notify; enforcement with no keyset refuses and the banner says
+why.
+
+### M2 — Run `kind-signed` end to end  *(~1 day, depends on M1)*
+
+**The item that must not slip.** It is what converts "we wrote a verifier" into "we ran
+one", and §2.6 is the argument: there is currently no evidence the signed path survives a
+real broker, 575 passing tests did not catch #885 or #888, and §4.4 step 2 records that
+the one comparable bug was found against a live broker and by no unit test.
+
+- Add `kind-signed` to `k8s_demo_flow.py --overlay`, which today accepts only
+  `("test", "kind", "demo")` and therefore **cannot drive the signed overlay at all**.
+- Two new stages: **a signed wake that verifies**, and **a forged event that is refused**.
+  The second is the money shot and has no script today.
+- Capture the on-cluster signing cost. ~150-200 ms/op in pure Python has to be inside the
+  wake-latency number on the slide, not omitted from it.
+- Update `IMPLEMENTATION_REPORT1.md` §8, which still says `ER_REQUIRE_SIGNATURE=true` has
+  no end-to-end run.
+
+Exit criteria: one command drives zero → signed wake → verified completion → forged event
+refused → zero, with assertions and timings.
+
+### M3 — Substitute the egress beat  *(a decision, not a build)*
+
+Per §4/W3, the `NetworkPolicy` MVP does not enforce on Kind's default CNI. Rather than
+change CNI or add a second cluster, **cut D3 and substitute the #888 asymmetry**:
+
+> Enforcement on, no keyset → refuses **nothing**, banner says `OFF`.
+> The request side, no key → refuses **everything**.
+> Both were documented as "refusal is on". One was true.
+
+This is a real, reproducible, measured trust-scope failure, it needs no new
+infrastructure, and it fits the talk's thesis better than a static allowlist would have —
+a deploy-time allowlist is the seam the abstract calls a *problem*, so demoing it
+straight always required an apology. Demo the fix landing.
+
+If D3 is wanted for real, record it on ykt1 as a separate clip and say on-slide that it
+is a different cluster.
+
+### M4 — #889 and the honesty pass  *(~2 hours, parallel)*
+
+- **#889** — a stale pidfile naming PID 1 crash-loops the pod after an abrupt exit. Low
+  glamour, high demo risk: this is the bug that bites when a pod is restarted between
+  rehearsal and the live run.
+- **Docs:** correct `keyset.py`'s "the upgrade path changes no verification logic" claim
+  (false per §8.3 — EdDSA-only against SPIRE's EC/RSA, and `keyset.load` rejects JWKS),
+  and `DESIGN_PHASE2.md` §6's `490/5` test count. Small, but in a repository whose §8 is
+  about claims that quietly stopped being true, a test count is the cheapest one to keep
+  honest.
+
+**Deferred: #887.** Widest blast radius in principle — an unauthenticated
+`PUT /transcript` changes what the agent resumes from — but the HMAC capability-key fix is
+real design work and invisible on stage. Mitigate operationally for the conference
+instead: do not expose the Route, or set `EB_AUTH_TOKENS`.
+
+### What the MVP cuts, explicitly
+
+| Cut | Why |
+|---|---|
+| **SPIRE** (§3 Option B) | Needs an issuer-agnostic verifier — EC/RSA added to hand-rolled pure-Python crypto, or relaxing §1.1 for `cryptography`. Dominant cost of the whole plan |
+| **D3 as a live beat** | kindnetd does not enforce NetworkPolicy (§4/W3) |
+| **Phase 3 tenancy** | Partly implemented, but owner-scoped reads are not. Good "what's next" material; do not demo it |
+| **Group-mirror replay verification** | Correct, but needs a flag and is not on stage |
+| **#887 code fix** | Mitigate operationally |
+
+### Sequencing
+
+```
+M1 (0.5d) ──▶ M2 (1d) ──▶ record the demo
+M4 (2h, parallel)
+M3 = a decision, not a build
+```
+
+M1 → M2 is strictly ordered: M2 is not worth running until M1's fixes are in. Rehearse on
+Kind, and note that Kind sets `group.initial.rebalance.delay.ms: 0` where the shared
+cluster leaves it at 3000 ms — so pick one for the recorded numbers and say which.
+
+### The talk the MVP supports
+
+| Seam | After M1-M4 |
+|---|---|
+| Unbound audit | ✅ closed — `ce_causationid` |
+| Unverified delivery | ✅ closed — signed, enforced, **and run on a cluster** |
+| Cold-start identity gap | ✅ demoed as the #888 asymmetry, named honestly |
+| Trust-scope drift | 🟡 named, with the deploy-time-allowlist limit stated and §8.3's SPIRE obstacles given |
+
+Plus the §8 section (§6.3 below), which is the differentiator and needs no engineering at
+all.
+
+---
+
+## 6. The 30-minute shape
 
 30 minutes is roughly **22–24 minutes of content, 4 minutes of demo, 3–4 minutes of
 questions.** The demo is the constraint: D1–D5 as written cannot be driven live in four
 minutes, because POST → pod Ready alone is ~14 s and a full cycle to zero is 22 s.
 
-### 5.1 Demo strategy: pre-record, narrate live
+### 6.1 Demo strategy: pre-record, narrate live
 
 **Record the demo. Do not run it live.** Reasons, in order of how much they would hurt:
 
@@ -383,7 +546,7 @@ It costs no tokens, is deterministic, and is auto-selected when no credential is
 The one thing it cannot show is *retained context* across a scale-to-zero (stage 2c), so
 either accept that or record that one beat separately against a funded key.
 
-### 5.2 Running order
+### 6.2 Running order
 
 | Min | Section | Notes |
 |---|---|---|
@@ -397,7 +560,7 @@ either accept that or record that one beat separately against a funded key.
 | 25–27 | What's next, honestly | SPIRE upgrade path + obstacles; Phase 3 tenancy as design |
 | 27–30 | Questions | |
 
-### 5.3 The §8 section is the differentiator — give it 3–4 minutes
+### 6.3 The §8 section is the differentiator — give it 3–4 minutes
 
 `DESIGN_PHASE2.md` §8 — thirteen documented claims that do not hold in code, each with a
 filed issue, plus the five-question checklist that came out of them — is the most valuable
@@ -425,7 +588,7 @@ not the verdict**.
 **This section also inoculates you.** Saying the thirteen out loud turns the open bugs
 from something a sharp attendee catches into evidence of rigor. Go first.
 
-### 5.4 Slide-by-slide sketch
+### 6.4 Slide-by-slide sketch
 
 | # | Slide | Content |
 |---|---|---|
@@ -447,7 +610,7 @@ from something a sharp attendee catches into evidence of rigor. Go first.
 | 16 | What's next | SPIRE upgrade + the EdDSA/JWKS obstacles; Phase 3 tenancy as design |
 | 17 | Links | Repo, `agentdocs/`, the five issues |
 
-### 5.5 Things to say out loud, verbatim
+### 6.5 Things to say out loud, verbatim
 
 Lifted from the code's own docstrings, which are better than a paraphrase:
 
@@ -462,7 +625,7 @@ any user."** That is standard PEP design and the alternative is worse (spreading
 GitHub credential across every runner), but somebody will ask. Phase 2 §2.7 has the
 answer ready.
 
-### 5.6 Likely questions, with answers that exist
+### 6.6 Likely questions, with answers that exist
 
 | Question | Where the answer is |
 |---|---|
@@ -472,17 +635,18 @@ answer ready.
 | Why not HMAC — it's 170,000× faster? | Phase 2 §4.3: symmetric, so EventBridge could forge any agent's response |
 | Kafka ACLs? | Phase 2 §3.3: the authorizer is global, not per-listener, so the demo is either broken or vacuous |
 | Multi-tenancy? | `DESIGN_PHASE3.md` §2–§3, **design only** |
-| What's the signing overhead? | ~150–200 ms/op. Get the on-cluster number in W2 |
+| What's the signing overhead? | ~150–200 ms/op. Get the on-cluster number in M2 |
 
 ---
 
-## 6. Risks
+## 7. Risks
 
 | Risk | Mitigation |
 |---|---|
-| D3 (egress block) never gets built | W3 is the smallest honest version; if it slips, **cut the beat from the demo list and say so**, rather than narrating something that didn't happen |
-| A reviewer finds #888 from the slides | Fix in W1; present it in the §8 section regardless |
-| Live demo fails | Pre-record (§5.1) |
+| D3 (egress block) cannot be built on Kind's default CNI | Resolved in the MVP: M3 cuts the beat and substitutes the #888 asymmetry. If D3 is wanted anyway, record it on ykt1 as a separate, separately-labelled clip (§4/W3) |
+| Something else promised in the demo list goes unbuilt | **Cut the beat and say so**, rather than narrating something that did not happen. §1.1's D1-D5 numbering exists so a cut is explicit rather than silent |
+| A reviewer finds #888 from the slides | Fix in M1; present it in the §8 section regardless — and after M3 it *is* a demo beat |
+| Live demo fails | Pre-record (§6.1) |
 | Real-agent path still budget-blocked | Mock mode for the recording; state it on-slide |
 | SPIRE question dominates Q&A | Prepare §3's two options as a 30-second answer |
 | Talk runs long | The §8 section is the one thing not to cut. Compress slides 6–8 |
@@ -490,9 +654,9 @@ answer ready.
 
 ---
 
-## 7. Observations worth carrying forward
+## 8. Observations worth carrying forward
 
-Five things from the 2026-10-05 review that are not obvious from any single document:
+Six things from the 2026-10-05 review that are not obvious from any single document:
 
 1. **The docs are more rigorous than the code, and that is unusual and valuable.** §8
    exists because somebody restated every claim for a reader who could not see the code,
@@ -518,16 +682,33 @@ Five things from the 2026-10-05 review that are not obvious from any single docu
    conclusion for group events and pins them; it does not for member answers. If anyone
    in the room works on authorization, this is the question they will ask.
 
+6. **§8.5.1 applies to infrastructure, not just to code — and this document broke the
+   rule while citing it.** The first version of §4/W3 recommended a `NetworkPolicy` as
+   the no-SPIRE MVP for the egress beat, written without checking which CNI the Kind
+   config creates. It is kindnetd, which accepts NetworkPolicy objects and enforces
+   none of them, so the recommendation would have produced a demo that appeared to work
+   and blocked nothing — the exact failure the talk is about, and the same shape as the
+   thirteen: a control claim that was true of the configuration imagined rather than the
+   one that exists. "Which code path, by name?" has to include "on which CNI, which
+   broker, which cluster".
+
 ### Caveats on the review this document is based on
 
 The code was read and the decision functions were run, but there was **no cluster
 access** — everything stated about cluster behaviour comes from `IMPLEMENTATION_REPORT1.md`
-rather than from observation. Cluster-dependent claims in §2 should be re-confirmed in W2.
+rather than from observation. Cluster-dependent claims in §2 should be re-confirmed in M2.
+
+The CNI finding in §8.6 was reached by reading `k8s/kind/kind-cluster.yaml`, not by
+applying a NetworkPolicy to a running Kind cluster and watching it fail to block. That
+is the right direction for the conclusion — kindnetd's lack of NetworkPolicy support is
+documented upstream — but by this document's own §8.6 rule it is still a claim that has
+been read rather than run. Confirm it before spending anything on either CNI option.
 
 ---
 
-## 8. Change log
+## 9. Change log
 
 | Date | Change |
 |---|---|
 | 2026-10-05 | Created. Captures the accepted abstract, status against it as of `main`, the SPIRE decision, the W1–W6 plan, and the 30-minute slide/demo shape |
+| 2026-10-05 | Added §5, the M1-M4 MVP cut (~2 days) with sequencing, explicit cuts and the talk it supports. Corrected §4/W3: Kind's default CNI is kindnetd and does not enforce NetworkPolicy, so the `NetworkPolicy` MVP was unbuildable as written — three options tabulated, M3 recommends substituting the #888 asymmetry for the egress beat. §7's risk table and §8's observations updated; the 30-minute shape renumbered §5→§6, risks §6→§7, observations §7→§8 |
