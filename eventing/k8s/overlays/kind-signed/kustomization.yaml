@@ -71,6 +71,14 @@ patches:
       # `env` does not exist on the base container (only `envFrom`), so this adds the
       # whole list rather than appending to it. A trailing-slash `env/-` op would fail
       # with "path does not exist" at render time.
+      #
+      # **The silent hazard is the other direction:** `op: add` on `…/env` REPLACES the
+      # list when one already exists. Safe here because this overlay builds on
+      # `../kind`, whose containers have no `env` — but `../demo` has three entries, so
+      # a `demo-signed` overlay built by changing only the base would silently drop
+      # `ER_MOCK_CLAUDE=false`, `HOME` and `CLAUDE_CONFIG_DIR` and run the demo in MOCK
+      # MODE. `kustomize build` succeeds and nothing warns. Whoever writes that overlay
+      # wants `op: add` on `env/-` per entry, against a base that already has the key.
       - op: add
         path: /spec/template/spec/containers/0/env
         value:
@@ -83,6 +91,14 @@ patches:
       # `env` does not exist on the base container (only `envFrom`), so this adds the
       # whole list rather than appending to it. A trailing-slash `env/-` op would fail
       # with "path does not exist" at render time.
+      #
+      # **The silent hazard is the other direction:** `op: add` on `…/env` REPLACES the
+      # list when one already exists. Safe here because this overlay builds on
+      # `../kind`, whose containers have no `env` — but `../demo` has three entries, so
+      # a `demo-signed` overlay built by changing only the base would silently drop
+      # `ER_MOCK_CLAUDE=false`, `HOME` and `CLAUDE_CONFIG_DIR` and run the demo in MOCK
+      # MODE. `kustomize build` succeeds and nothing warns. Whoever writes that overlay
+      # wants `op: add` on `env/-` per entry, against a base that already has the key.
       - op: add
         path: /spec/template/spec/containers/0/env
         value:
