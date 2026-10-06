@@ -447,8 +447,9 @@ knowing before a demo.
 
 ## 8. What the docs review found (added after rossoctl/rossoctl#2609)
 
-**Scope.** §8.1–§8.4 are about **Phase 2** specifically: thirteen claims *this
+**Scope.** §8.1–§8.3 are about **Phase 2** specifically: thirteen claims *this
 document* made about the identity and signing controls, which do not hold in the code.
+§8.4 is commentary on why they all failed the same way, and enumerates none of them.
 §8.5–§8.8 are the general procedure that came out of them, and apply to a claim made in
 any phase — Phase 3's design makes claims of the same shape about tenancy and the signed
 attribute set, and nothing here is Phase 2 only.
@@ -521,7 +522,6 @@ this document made that the code never matched, or stopped matching — so the c
 saying out loud where that does not apply, since an unlinked finding otherwise reads as
 an oversight.
 
-
 - **§2.6 records `submitter`/`submitteriss` as unsigned.** They joined `SIGNED_ATTRS`
   in §4.2, so the signature covers them. The limit that remains is a different one and
   worth stating as such: a signature proves EventBridge *asserted* the name.
@@ -550,7 +550,7 @@ document is written.
 
 ### 8.5 Checking a control claim before it ships
 
-§8.1–§8.4 are what thirteen unchecked claims cost. What follows is the procedure that
+§8.1–§8.3 are what thirteen unchecked claims cost. What follows is the procedure that
 came out of them: five questions to ask of any sentence that says a security control
 does something, how to check it cheaply, and what a correction should preserve.
 
