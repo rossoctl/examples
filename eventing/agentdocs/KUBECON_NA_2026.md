@@ -67,7 +67,7 @@ tracks each one separately.
 | D2 | signed task event → agent wake | 🟡 JWS real, never run on a cluster |
 | D3 | blocked egress on a wrong-scope call | ❌ **no implementation at all** |
 | D4 | completion bound to the wake event | ✅ `ce_causationid` |
-| D5 | scale to zero when agents are idle | ✅ measured, 22 s full cycle |
+| D5 | scale to zero when agents are idle | ✅ measured, 30–31 s back to zero with `cooldownPeriod: 30` |
 
 ---
 
@@ -75,24 +75,34 @@ tracks each one separately.
 
 Assessed 2026-10-05 against `main`. Method: read all nine `agentdocs/` files and the
 full source, then **ran the identity decision functions** rather than trusting
-docstrings — which is this repository's own §8.6 rule, and it changed two conclusions.
+docstrings — which is `DESIGN_PHASE2.md` §8.6's rule, and it changed two conclusions.
 
-Test suite at review time: **575 passed, 5 skipped**. (`DESIGN_PHASE2.md` §6 says
-490/5 — the suite has grown; the doc is stale, not wrong.)
+Test suite at review time: **904 collected**. On CI, 896 passed and 8 skipped; on a
+laptop with the `claude` CLI on `PATH`, 899 passed and 5 skipped — the three extra CI
+skips are `test_agentspec.py`'s pinned-CLI check plus `test_graceful_shutdown.py`, which
+needs a reachable Kafka. The five constant skips are `test_manifests.py`'s
+`no reachable cluster` cases. Quote the collected count and the environment, not a bare
+pass figure. (`DESIGN_PHASE2.md` §6 says 490/5; that is Phase 2's own delta measurement,
+not a live count — see §5/M4 before touching it.)
 
 ### 2.1 The four seams
 
 | Seam | Named CNCF integration | Code status |
 |---|---|---|
-| Cold-start identity gap | SPIRE → KEDA | ❌ **No SPIRE/SPIFFE/SVID in the implementation.** 7 mentions total, all prose, all aspirational |
+| Cold-start identity gap | SPIRE → KEDA | ❌ **No SPIRE/SPIFFE/SVID in `eventing/`.** 8 mentions across 4 files, all prose, all aspirational. (`mcp/wiki_memory_tool/` does ship header-simulated SPIFFE identity — a different component, and its own README notes there is no real SVID verification) |
 | Trust-scope drift | SPIRE → egress sidecar | ❌ **No NetworkPolicy, no Istio, no AuthorizationPolicy, no sidecar** |
 | Unverified delivery | CloudEvents verifier → Knative trigger | 🟡 Verification exists and is real; **no Knative** (Strimzi instead, which the abstract permits) |
 | Unbound audit | event bus → work record | 🟡 `ce_causationid` binds response to request; **the replay path verifies nothing** |
 
 ### 2.2 What is genuinely done and demo-ready
 
-- **KEDA scale-to-zero, measured on two clusters.** OpenShift and Kind. POST → KEDA
-  decision 1.7–3.0 s; POST → pod Ready ~14 s; full cycle back to zero 22 s.
+- **KEDA scale-to-zero, measured on two clusters.** OpenShift (ykt1) and Kind. The only
+  sourced figures are `IMPLEMENTATION_REPORT1.md` §3's: wake latency **1.0–5.0 s** on
+  ykt1 and **2.2–4.3 s** on Kind; scale back to zero **30–31 s** with
+  `cooldownPeriod: 30`; image pull **5.1 s** cold (245 MB), 454 ms–2.45 s warm. Earlier
+  drafts of this file quoted 1.7–3.0 s, ~14 s and 22 s, which appear in no other document
+  in the repository — do not put them on a slide. Per §4's own sequencing note, ykt1 and
+  Kind timings are not comparable, so say which cluster a number is from.
 - **Detached JWS over the CloudEvent envelope.** Ed25519 implemented from RFC 8032 in
   pure Python, checked against the RFC's own test vectors.
 - **The canonicalization is injective.** Length-prefixed (netstring-style) fields, after
@@ -119,6 +129,11 @@ a challenge; the code has it.
 
 ### 2.4 Confirmed by running the code
 
+<!-- VERIFY v0.9.0: this table describes #888 and #885 while they are open. Once
+     rossoctl/examples#888 lands, "refuses nothing without a keyset" becomes false and the
+     row should say what the fail-closed behaviour is; once #885 lands, drop the
+     rewrite-still-applies row. Do not delete the table — it is §5/M3's demo beat. -->
+
 Not from docstrings. These five lines are the honest state of response verification:
 
 ```
@@ -130,12 +145,14 @@ E) forged group.completed, enforced -> refused by verifier… then applied anywa
 ```
 
 **(D) is a deliberate policy, not a bug.** `emit()` signs terminal events only, because
-it runs per `stdout` frame and Ed25519 costs ~150–200 ms here; signing every frame would
+it runs per `stdout` frame and Ed25519 costs **222 ms to sign, 227 ms to verify** here
+(`IMPLEMENTATION_REPORT1.md` §9, measured — not the ~150–200 ms the docstrings
+estimate); signing every frame would
 add minutes to a chatty run. The verifier matches that policy. The honest limit: this
 proves *who finished a run*, not *what it said along the way*. Say that on stage.
 
 **(E) is the one that will bite on stage.** `signing.response_decision` correctly refuses
-the forged `group.completed`. But `kafka_in.py:122` rewrites only `phase` and `data` — it
+the forged `group.completed`. But `kafka_in.py:138` rewrites only `phase` and `data` — it
 preserves `type` and `groupid`, then routes on `is_group_event(evt)` using the
 **original** event. `group_service.on_group_event` reads only those two fields, so it
 calls `complete_group()` anyway. A forged event the verifier *correctly rejected* still
@@ -146,6 +163,10 @@ So "the event broker log is tamper-evident audit" is currently half-true: the lo
 replayable, but the replay trusts it unconditionally.
 
 ### 2.5 Open bugs, all still open
+
+<!-- VERIFY v0.9.0: re-check each of rossoctl/examples#885-#889 before the talk. "All still
+     open" is the claim with the shortest shelf life in this document, and §5/M1 and M4 are
+     the work that invalidates it. Update the row rather than the heading. -->
 
 From the `DESIGN_PHASE2.md` §8 docs review. None fixed as of 2026-10-05.
 
@@ -294,8 +315,11 @@ repository's own precedent says unit tests do not catch this class of bug.
   refused** — the latter is the money shot and currently has no script.
 - Record the result in `IMPLEMENTATION_REPORT1.md` §8, which still says
   `ER_REQUIRE_SIGNATURE=true` has no end-to-end run.
-- Measure the signing cost on-cluster. Ed25519 here is ~150–200 ms/op in pure Python;
-  the wake-path latency number on the slides must include it.
+- Confirm the signing cost on-cluster. `IMPLEMENTATION_REPORT1.md` §9 already measured
+  **222 ms / 227 ms** on a laptop — re-running it here gave 190/198 ms median, so treat
+  ~190–230 ms as the pure-Python band and the hardware as the variable. This is a
+  confirmation on cluster hardware, not a first measurement, and the wake-path latency
+  number on the slides must include it.
 
 Exit criteria: one command drives zero → signed wake → verified completion → forged
 event refused → zero, with assertions and timings.
@@ -356,11 +380,14 @@ deliberately-denied call actually fails before relying on it.
 The talk will send people to this repository. Three fixes:
 
 - `keyset.py`'s "upgrade path changes no verification logic" claim — correct it per
-  §8.3, in place, since the module docstring is what a reader lands on.
-- `DESIGN_PHASE2.md` §6's test count (490/5 → current). Small, but the talk's thesis is
-  about claims that quietly stopped being true.
-- Add the `<!-- VERIFY -->` comments §8.5.5 prescribes to any statement in this file that
-  depends on #885–#889 staying open. That is this document eating its own cooking.
+  `DESIGN_PHASE2.md` §8.3, in place, since the module docstring is what a reader lands on.
+- A footnote on `DESIGN_PHASE2.md` §6's test count pointing at §2's current figure.
+  **Not** an overwrite: `490/5` is Phase 2's delta measurement and its "adds 40 over
+  450/5" arithmetic depends on it. Small, but the talk's thesis is about claims that
+  quietly stopped being true, and a historical measurement never stopped being true.
+- The `<!-- VERIFY -->` comments `DESIGN_PHASE2.md` §8.5.5 prescribes are now in this
+  file (§2.4, §2.5, §5/M1, §5/M3, §6.3) as of M4 — W5 is after the talk, which was too
+  late for a document whose §5/M3 depends on #888 staying open. Re-check them here.
 
 ### W6 — Stretch, only if W1–W4 land early
 
@@ -404,9 +431,13 @@ M2 is the one that must not slip. M3 is a call to make, not work to schedule.
 
 ### M1 — Fix #888, then #885  *(~0.5 day)* — [#895](https://github.com/rossoctl/examples/issues/895)
 
-Both call sites were read; both are small and localised.
+Both call sites were read; both are small and localised. Every `path:line` below is
+against **`0667270`**, this document's base — the first draft cited `3264e8d`, the commit
+before #883, and the rebase moved `kafka_in.py` by +16 lines and `__main__.py` by +4
+without the pointers being re-derived. Re-derive them, do not adjust them, after any
+rebase.
 
-**#888** — `kafka_in.py:93`. The decision is unreachable without a keyset:
+**#888** — `kafka_in.py:109`. The decision is unreachable without a keyset:
 
 ```python
 ok, why = True, "not checked"
@@ -414,19 +445,19 @@ if self._keyset is not None:        # <- `require` is never consulted
 ```
 
 Fix: when `require_signature` is on and `keyset is None`, fail closed. **The startup
-banner matters as much as the behaviour** — `__main__.py:76` prints
+banner matters as much as the behaviour** — `__main__.py:80` prints
 `response verification OFF` in exactly that configuration, so an operator who asked for
 enforcement is told it is off and refuses nothing. The silent wrong state is the bug;
 the missing refusal is only half of it.
 
-**#885** — `kafka_in.py:136` routes on `is_group_event(evt)`, the **original** event, so
+**#885** — `kafka_in.py:152` routes on `is_group_event(evt)`, the **original** event, so
 the rejection rewrite reaches `on_group_event` → `complete_group()`. The rewrite
 deliberately preserves `type` and `groupid` for forensics (`insert_response` derives both
 `data_json` and `raw_json` from the one dict), so the fix is not to strip them: it is to
 not route a **rejected** event to the group handler at all. The forensic record already
 lives under `data["rejected"]`, so nothing is lost.
 
-Tests must **assert the outcome, not the verdict** — §8.6's rule.
+Tests must **assert the outcome, not the verdict** — `DESIGN_PHASE2.md` §8.6's rule.
 `response_decision` returning `False` is not the same as the batch not completing, and
 that gap *is* #885.
 
@@ -442,15 +473,16 @@ why.
 
 **The item that must not slip.** It is what converts "we wrote a verifier" into "we ran
 one", and §2.6 is the argument: there is currently no evidence the signed path survives a
-real broker, 575 passing tests did not catch #885 or #888, and §4.4 step 2 records that
+real broker, ~900 passing tests did not catch #885 or #888, and §4.4 step 2 records that
 the one comparable bug was found against a live broker and by no unit test.
 
 - Add `kind-signed` to `k8s_demo_flow.py --overlay`, which today accepts only
   `("test", "kind", "demo")` and therefore **cannot drive the signed overlay at all**.
 - Two new stages: **a signed wake that verifies**, and **a forged event that is refused**.
   The second is the money shot and has no script today.
-- Capture the on-cluster signing cost. ~150-200 ms/op in pure Python has to be inside the
-  wake-latency number on the slide, not omitted from it.
+- Capture the on-cluster signing cost. The measured laptop figure is 222 ms / 227 ms
+  (`IMPLEMENTATION_REPORT1.md` §9), ~190–230 ms across re-runs; whatever the cluster
+  gives has to be inside the wake-latency number on the slide, not omitted from it.
 - Update `IMPLEMENTATION_REPORT1.md` §8, which still says `ER_REQUIRE_SIGNATURE=true` has
   no end-to-end run.
 
@@ -458,6 +490,12 @@ Exit criteria: one command drives zero → signed wake → verified completion �
 refused → zero, with assertions and timings.
 
 ### M3 — Substitute the egress beat  *(a decision, not a build)*
+
+<!-- VERIFY v0.9.0: this beat demos rossoctl/examples#888 as a live bug, and M1 fixes #888.
+     Run M1 and M3 in that order and the beat becomes "watch the fix land"; fix #888 first
+     without reading this and the substituted beat no longer reproduces. If #888 is already
+     closed when you read this, reframe the beat as before/after rather than deleting it —
+     the asymmetry is the point, not the bug. -->
 
 Per §4/W3, the `NetworkPolicy` MVP does not enforce on Kind's default CNI. Rather than
 change CNI or add a second cluster, **cut D3 and substitute the #888 asymmetry**:
@@ -480,10 +518,17 @@ is a different cluster.
   glamour, high demo risk: this is the bug that bites when a pod is restarted between
   rehearsal and the live run.
 - **Docs:** correct `keyset.py`'s "the upgrade path changes no verification logic" claim
-  (false per §8.3 — EdDSA-only against SPIRE's EC/RSA, and `keyset.load` rejects JWKS),
-  and `DESIGN_PHASE2.md` §6's `490/5` test count. Small, but in a repository whose §8 is
-  about claims that quietly stopped being true, a test count is the cheapest one to keep
-  honest.
+  (false per §8.3 — EdDSA-only against SPIRE's EC/RSA, and `keyset.load` rejects JWKS).
+  **Leave `DESIGN_PHASE2.md` §6's `490/5` alone:** it is Phase 2's own delta measurement
+  — "adds 40 over a 450/5 baseline on the same tree" — not a live claim about the suite,
+  and overwriting it breaks that arithmetic. The `agentdocs` README says a phase record
+  is superseded explicitly rather than edited in place. Add a footnote pointing at §2's
+  current count instead.
+- Add the `<!-- VERIFY -->` comments `DESIGN_PHASE2.md` §8.5.5 prescribes to any statement
+  in this file that depends on #885–#889 staying open — §2.4's table, §2.5, §5/M1 and
+  §6.3's slide, and in particular **§5/M3**, whose substituted demo beat stops reproducing
+  once M1 lands. Naming the release, the issue and what should change is the rule; this
+  document prescribing markers it does not carry is the same inversion §8 is about.
 
 **Deferred: #887.** Widest blast radius in principle — an unauthenticated
 `PUT /transcript` changes what the agent resumes from — but the HMAC capability-key fix is
@@ -530,7 +575,9 @@ all.
 
 30 minutes is roughly **22–24 minutes of content, 4 minutes of demo, 3–4 minutes of
 questions.** The demo is the constraint: D1–D5 as written cannot be driven live in four
-minutes, because POST → pod Ready alone is ~14 s and a full cycle to zero is 22 s.
+minutes: wake alone is 1.0–5.0 s on ykt1 and the cycle back to zero is 30–31 s with
+`cooldownPeriod: 30` (`IMPLEMENTATION_REPORT1.md` §3), and that is before the agent
+does any work.
 
 ### 6.1 Demo strategy: pre-record, narrate live
 
@@ -539,8 +586,9 @@ minutes, because POST → pod Ready alone is ~14 s and a full cycle to zero is 2
 1. The full four-stage loop is ~6 minutes in mock mode (`k8s_demo_flow.py`), and the
    real-agent path has been blocked on an exhausted LiteLLM team budget
    (`IMPLEMENTATION_REPORT1.md` §7) — a 429 on stage is unrecoverable.
-2. Image pull is ~12 s of the ~14 s wake. Pre-pull on the node and the number improves,
-   but it is still dead air.
+2. A cold image pull is 5.1 s of the wake (245 MB); warm it is 454 ms–2.45 s
+   (`IMPLEMENTATION_REPORT1.md` §3). Pre-pull on the node and the number improves, but
+   it is still dead air.
 3. Conference wifi. Phase 2 §2.5 already lists offline operation as a design
    requirement for exactly this reason.
 4. #889 crash-loops a pod after an abrupt exit.
@@ -571,6 +619,11 @@ either accept that or record that one beat separately against a funded key.
 
 ### 6.3 The §8 section is the differentiator — give it 3–4 minutes
 
+<!-- VERIFY v0.9.0: "thirteen claims that do not hold in code" is true while #885-#889 are
+     open. As they land, the count of claims that do not hold drops while the count of
+     claims that *were* found stays thirteen — say "thirteen found" on the slide, not
+     "thirteen outstanding", so the number does not need re-deriving before the talk. -->
+
 `DESIGN_PHASE2.md` §8 — thirteen documented claims that do not hold in code, each with a
 filed issue, plus the five-question checklist that came out of them — is the most valuable
 artifact in this repository, and it is more on-theme than it first appears.
@@ -590,7 +643,8 @@ will be presenting one. The five questions (§8.5) compress to one slide:
 4. Can an attacker choose the input the check reads?
 5. What does the claim become one release from now?
 
-Plus the two rules from §8.6 that generalize best: **call the real function** (a
+Plus the two rules from `DESIGN_PHASE2.md` §8.6 that generalize best: **call the real
+function** (a
 reimplementation of the guard proves nothing about the guard), and **assert the outcome,
 not the verdict**.
 
@@ -644,7 +698,7 @@ answer ready.
 | Why not HMAC — it's 170,000× faster? | Phase 2 §4.3: symmetric, so EventBridge could forge any agent's response |
 | Kafka ACLs? | Phase 2 §3.3: the authorizer is global, not per-listener, so the demo is either broken or vacuous |
 | Multi-tenancy? | `DESIGN_PHASE3.md` §2–§3, **design only** |
-| What's the signing overhead? | ~150–200 ms/op. Get the on-cluster number in M2 |
+| What's the signing overhead? | 222 ms sign / 227 ms verify, measured (`IMPLEMENTATION_REPORT1.md` §9). Pure Python; `cryptography` does it in microseconds. Confirm on-cluster in M2 |
 
 ---
 
@@ -673,7 +727,7 @@ Six things from the 2026-10-05 review that are not obvious from any single docum
 
 2. **Reading the code is not enough, and neither is the test suite.** All thirteen
    findings coexisted with a passing suite, because the tests exercised the configuration
-   each claim was true in. 575 passing tests did not catch #885 or #888.
+   each claim was true in. ~900 passing tests did not catch #885 or #888.
 
 3. **My own first attempt at the group-forgery test reported no issue** — because I used
    wrong event-type constants (`io.rossoctl.…` instead of `dev.rossoctl.agent.group.
@@ -707,10 +761,10 @@ The code was read and the decision functions were run, but there was **no cluste
 access** — everything stated about cluster behaviour comes from `IMPLEMENTATION_REPORT1.md`
 rather than from observation. Cluster-dependent claims in §2 should be re-confirmed in M2.
 
-The CNI finding in §8.6 was reached by reading `k8s/kind/kind-cluster.yaml`, not by
+The CNI finding in §8 observation 6 was reached by reading `k8s/kind/kind-cluster.yaml`, not by
 applying a NetworkPolicy to a running Kind cluster and watching it fail to block. That
 is the right direction for the conclusion — kindnetd's lack of NetworkPolicy support is
-documented upstream — but by this document's own §8.6 rule it is still a claim that has
+documented upstream — but by `DESIGN_PHASE2.md` §8.6's rule it is still a claim that has
 been read rather than run. Confirm it before spending anything on either CNI option.
 
 ---
