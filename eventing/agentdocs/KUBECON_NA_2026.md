@@ -393,7 +393,16 @@ The line the MVP buys:
 That is achievable. Four seams delivered is not, and attempting it is what puts the talk
 at risk.
 
-### M1 — Fix #888, then #885  *(~0.5 day)*
+| | Item | Effort | Tracked | Blocks |
+|---|---|---|---|---|
+| **M1** | Fix #888, then #885 | ~0.5 d | [#895](https://github.com/rossoctl/examples/issues/895) | M2 |
+| **M2** | Run `kind-signed` end to end | ~1 d | [#896](https://github.com/rossoctl/examples/issues/896) | the recording |
+| **M3** | Substitute the egress beat | a decision | — | the demo list |
+| **M4** | #889 + the honesty pass | ~2 h | #889 | — |
+
+M2 is the one that must not slip. M3 is a call to make, not work to schedule.
+
+### M1 — Fix #888, then #885  *(~0.5 day)* — [#895](https://github.com/rossoctl/examples/issues/895)
 
 Both call sites were read; both are small and localised.
 
@@ -429,7 +438,7 @@ Exit criteria: a forged `group.completed` with enforcement on does **not** compl
 batch and does **not** notify; enforcement with no keyset refuses and the banner says
 why.
 
-### M2 — Run `kind-signed` end to end  *(~1 day, depends on M1)*
+### M2 — Run `kind-signed` end to end  *(~1 day, depends on M1)* — [#896](https://github.com/rossoctl/examples/issues/896)
 
 **The item that must not slip.** It is what converts "we wrote a verifier" into "we ran
 one", and §2.6 is the argument: there is currently no evidence the signed path survives a
@@ -711,4 +720,5 @@ been read rather than run. Confirm it before spending anything on either CNI opt
 | Date | Change |
 |---|---|
 | 2026-10-05 | Created. Captures the accepted abstract, status against it as of `main`, the SPIRE decision, the W1–W6 plan, and the 30-minute slide/demo shape |
+| 2026-10-06 | M1 and M2 filed as #895 and #896; §5 gains a tracking table |
 | 2026-10-05 | Added §5, the M1-M4 MVP cut (~2 days) with sequencing, explicit cuts and the talk it supports. Corrected §4/W3: Kind's default CNI is kindnetd and does not enforce NetworkPolicy, so the `NetworkPolicy` MVP was unbuildable as written — three options tabulated, M3 recommends substituting the #888 asymmetry for the egress beat. §7's risk table and §8's observations updated; the 30-minute shape renumbered §5→§6, risks §6→§7, observations §7→§8 |
