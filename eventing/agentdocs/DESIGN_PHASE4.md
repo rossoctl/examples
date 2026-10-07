@@ -211,7 +211,7 @@ useful on its own, and the thing a user hits when a notification did not arrive.
 
 Typing 26 random base32 characters into a phone is the step where enrollment fails in
 practice, so the `ntfy://` deep link exists to be scanned rather than typed. But Phase 1
-Phase 1 §1.1 forbids `qrcode`/`Pillow`, so a terminal QR means ~150 lines of hand-rolled
+§1.1 forbids `qrcode`/`Pillow`, so a terminal QR means ~150 lines of hand-rolled
 encoder in this repository forever.
 
 **Recommendation: ship the deep link as text first, and add the QR only if a demo shows
@@ -409,6 +409,7 @@ one is the easy and wrong thing to do:
 | `404` | unknown approval id, **or one owned by another tenant** | Phase 3 §6.2's rule: a `403` would confirm another tenant's id exists |
 | `409` | valid key, already decided | the answer is already in; returns the existing verdict rather than pretending to accept a second one |
 | `410` | past `expires_utc` | distinct from `403`: the key was good, the window closed |
+| `503` | `EB_CAPABILITY_SECRET_PATH` empty (§7.1) | distinct from `404`: the endpoint exists and approvals are enabled, but nothing can authorise a decision — the remedy is the operator's, not the caller's |
 
 ### 5.7 Timeout is a deny, and is recorded as a timeout
 
@@ -422,12 +423,22 @@ The budget ordering is a real constraint and belongs in the configuration table 
 
 ```
 ER_APPROVAL_TIMEOUT_S  <  the settings file's per-hook "timeout"  <  the turn's wall clock
+                       ≤  ER_DRAIN_TIMEOUT_S  <  terminationGracePeriodSeconds
 ```
 
-Getting it backwards means the CLI kills the hook before it can answer, and a killed hook
-is a *non-blocking error* — execution proceeds, which is to say **the tool runs
-unapproved**. That is the failure direction this phase cannot have, so §7 pins the
-inequality and a startup check prints all three values.
+The left pair, getting it backwards, means the CLI kills the hook before it can answer,
+and a killed hook is a *non-blocking error* — execution proceeds, which is to say **the
+tool runs unapproved**. That is the failure direction this phase cannot have.
+
+The right pair is §6's constraint arriving here, and it matters for the opposite reason:
+`ER_APPROVAL_TIMEOUT_S` is exactly the knob an operator raises when humans say two minutes
+is not enough to find their phone. Raised to `600` it outlives the drain budget — a
+rolling update or a scale-down then lands a SIGKILL mid-approval, the run dies with the
+approval row still pending, and §6's late-approval path replays a turn whose partition was
+taken away mid-flight. A quiet version of the same failure direction. So §7 pins the whole
+chain and a startup check prints all five values, and `test_manifests.py`'s
+`test_the_drain_timeout_fits_inside_the_termination_grace_period` gains one more `assert`
+in the same shape: `ER_APPROVAL_TIMEOUT_S < ER_DRAIN_TIMEOUT_S`, in the rendered ConfigMap.
 
 ### 5.8 The notification carries what is being approved
 
@@ -485,7 +496,8 @@ The blocking hook is the primary path and is not sufficient alone. A pod holding
 partition while a hook waits on a human is spending the `ER_DRAIN_TIMEOUT_S` /
 `terminationGracePeriodSeconds` budget that `test_manifests.py` already pins, and KEDA
 will not scale a pod away mid-run. An unbounded wait is therefore not available, however
-much the control would like one.
+much the control would like one. That bound is the right-hand half of §5.7's budget chain:
+the hook's wait, not just the turn, has to fit inside the drain budget.
 
 So the sequence, which is why §5.7's timeout is a *deny* rather than an error:
 
@@ -496,7 +508,7 @@ So the sequence, which is why §5.7's timeout is a *deny* rather than an error:
    later is answering a live question.
 3. **A late approval starts a new turn.** The notification's action becomes
    `POST /v0/agents/{corr}/continue?k=…` — the existing `/continue` path with Phase 3
-   Phase 3 §4.4's capability key — and the recorded `allow` means the hook permits that one call
+   §4.4's capability key — and the recorded `allow` means the hook permits that one call
    without asking again, matched on `(correlationid, tool, input_sha256)`.
 
 The cost is honest: **the agent redoes the work up to that point.** The grant is scoped to
@@ -526,7 +538,7 @@ nothing behaves exactly as it did in Phase 3.
 | Variable | Default | Effect |
 |---|---|---|
 | `ER_APPROVAL_TOOLS` | empty | Comma-separated tool names that need approval. **Empty guards nothing** — the whole phase is inert. |
-| `ER_APPROVAL_TIMEOUT_S` | `110` | The hook's long-poll budget. Must be **below** the settings file's per-hook `timeout` (§5.7). |
+| `ER_APPROVAL_TIMEOUT_S` | `110` | The hook's long-poll budget. Must be **below** the settings file's per-hook `timeout` **and** below `ER_DRAIN_TIMEOUT_S` — the full chain is §5.7's, and the manifest test pins this link too. |
 | `ER_APPROVAL_FAIL_OPEN` | `false` | What the hook does when EventBridge is unreachable. `false` = deny. §9 is why the default cannot be `true`. |
 
 Secret-vs-ConfigMap, continuing Phase 2 §5's rule and Phase 3 §8.3's: both secret paths
@@ -629,11 +641,9 @@ The §6 fallback exists *only* because a hook cannot block indefinitely. If Even
 ever rebuilt on the Agent SDK, `canUseTool` (§2.1) replaces the hook, the timeout stops
 being structural, and §6 becomes a compatibility path rather than a necessity.
 
-```markdown
 <!-- VERIFY: if EventRunner moves to the Agent SDK, §2.1's constraint lifts and §6's
      "timeout is a deny" is no longer forced. Rewrite §6 as an option, not a
      requirement — and keep §5.7's timeout/deny distinction, which survives either way. -->
-```
 
 Per Phase 2 §8.5.5, that says *what should change*, not merely that something will — and the
 second clause matters, because the part of §6 that survives the fix is the part a
