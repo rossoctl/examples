@@ -62,10 +62,15 @@ def svc(tmp_path):
     return GroupService(cfg, store, producer, SeqMinter()), store, producer, cfg
 
 
-def member_event(groupid, corr, *, final=False, phase="stdout", text="hi", seq=1):
-    return {"correlationid": corr, "groupid": groupid, "sequence": seq,
-            "phase": phase, "final": "true" if final else "false",
-            "data": {"text": text, "role": "final" if final else "assistant"}}
+def member_event(groupid, corr, *, final=False, phase="stdout", text="hi", seq=1,
+                 userkey=None):
+    e = {"correlationid": corr, "groupid": groupid, "sequence": seq,
+         "phase": phase, "final": "true" if final else "false",
+         "data": {"text": text, "role": "final" if final else "assistant"}}
+    if userkey:
+        from shared import ce
+        e[ce.EXT_USERKEY] = userkey
+    return e
 
 
 # ---- the wire ---------------------------------------------------------------
@@ -401,13 +406,18 @@ def test_a_finished_group_does_not_poll():
 # ---- ntfy: announce the edges, suppress the middle -------------------------
 
 class RecordingNtfy:
-    """NtfyPublisher with the network replaced, so submit/suppress logic is testable."""
+    """NtfyPublisher with the network replaced, so submit/suppress logic is testable.
 
-    def __init__(self, store, notify_errors=False):
+    `stores=` is the multi-tenant registry passthrough: without it the fixture can
+    only exercise the single-store path, and the suppression verdict is now "is there
+    a `group_members` row in the store this event ROUTED to" — which a single store
+    can never distinguish from "the only store"."""
+
+    def __init__(self, store, notify_errors=False, stores=None):
         from eventbridge.config import NtfyCfg
         from eventbridge.ntfy import NtfyPublisher
         cfg = NtfyCfg(enabled=True, topic="t", group_notify_errors=notify_errors)
-        self.pub = NtfyPublisher(cfg, "http://eb.test", store=store)
+        self.pub = NtfyPublisher(cfg, "http://eb.test", store=store, stores=stores)
         self.sent = []
         self.pub._post = lambda payload: self.sent.append(payload)
 
@@ -452,6 +462,13 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
     completes: KEDA scales a pod down, its offset was never committed, Kafka redelivers
     the request and the agent re-runs. Suppression keyed on "group still open" let every
     one of those through. Membership is the correct key.
+
+    A redelivery is always a RECORDED member: both submission paths call
+    `add_group_member` before publishing the request, precisely so a fast agent's
+    terminal event can be attributed, and `on_member_event` records membership again on
+    arrival -- ahead of the ntfy fan-out, which `kafka_in.run()` invokes afterwards. So
+    reading membership from the store rather than from `ce_groupid` suppresses
+    redeliveries exactly as before.
     """
     s, store, _, _ = svc
     gid, _ = s.create(label="batch", expected=1)
@@ -461,8 +478,14 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
 
     n = RecordingNtfy(store)
     n.submit_and_drain(member_event(gid, corr, final=True, phase="result"))
-    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
     assert n.sent == [], "a batch is two notifications, not two plus its redeliveries"
+
+    # A correlation id that is NOT a recorded member but claims the group is a different
+    # case, and deliberately notifies now -- see
+    # test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member.
+    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
+    assert len(n.sent) == 1, \
+        "an unrecorded correlation id is not silenced by the groupid it asserts"
 
 
 def test_a_hundred_members_produce_exactly_two_notifications(svc):
@@ -491,6 +514,106 @@ def test_an_ungrouped_agent_still_notifies(svc):
     n.submit_and_drain({"correlationid": "solo", "phase": "result", "final": "true",
                         "data": {"text": "hi"}})
     assert len(n.sent) == 1
+
+
+def test_a_member_event_without_a_groupid_is_still_suppressed(svc):
+    """The forger controls every attribute on the event -- including by leaving it out.
+
+    Suppression used to read `ce_groupid` off the event, so a frame that simply OMITTED
+    it was not a group member as far as the check was concerned: it was pushed, stored
+    in the member's transcript and shown on the group page. `DESIGN_PHASE2.md` §8.5.4
+    states the rule this is an instance of -- prefer deciding on state the attacker does
+    not supply: group membership from the store, not the groupid on the frame.
+
+    Reachable even with signing fully enforced, because this is a routing decision on
+    an attacker-supplied attribute, not a signature check.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="result")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "membership comes from group_members, not from the frame"
+
+
+def test_a_forged_terminal_frame_without_a_groupid_does_not_page(svc):
+    """The sharper edge of the same hole: a terminal frame reaches `_publish` as an
+    error, which pages at priority 5 even with NTFY_GROUP_NOTIFY_ERRORS off -- and does
+    not count the member as failed, so the batch's own arithmetic disagreed with the
+    notification the operator had just received."""
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="error")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store, notify_errors=False)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "a member's error must stay suppressed while errors are off"
+
+
+def test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member(svc):
+    """The converse, and the reason the fix is not simply "read both".
+
+    An event asserting a `ce_groupid` it is not a recorded member of must not be able to
+    silence itself by that assertion. Legitimate members are always recorded first --
+    both submission paths call `add_group_member` before publishing -- so only a forgery
+    reaches here unrecorded.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    s.submit_members(gid, ["a"])
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(member_event(gid, "never-submitted-0001",
+                                    final=True, phase="result"))
+    assert len(n.sent) == 1, "the groupid on the frame cannot buy silence"
+
+
+@pytest.mark.xfail(strict=True, reason="#904: in multi-tenant mode the store this "
+                                      "lookup routes to is chosen by ce_userkey")
+def test_a_forged_frame_cannot_change_stores_to_escape_suppression(svc, tmp_path):
+    """The multi-tenant member of the omission class, currently open.
+
+    The verdict is "is there a `group_members` row for this corr in the store this
+    event ROUTED to", and in multi-tenant mode the routing is `ce_userkey` — an
+    attribute the forger controls exactly as they controlled `ce_groupid`. A frame
+    that keeps `ce_groupid` but omits `ce_userkey` routes to `shared/`, where the
+    membership row is not, and escapes suppression: it is pushed, and a terminal
+    `phase=error` frame pages at priority 5 with errors off.
+
+    Both sides go through one registry, so the membership row IS in the per-user
+    store the frame with its `ce_userkey` intact would route to — the only thing
+    standing between the stripped frame and suppression is the routing itself.
+
+    Pre-existing (the old code called `_store_for` too), closed for single-tenant by
+    this PR, and tracked as #904 — where the fix is to resolve the store from the
+    ownership index, which the forger does not supply. This test is
+    `xfail(strict=True)` so it records the hole and flips to a pass the moment the
+    fix lands."""
+    from eventbridge.group_service import GroupService
+    from eventbridge.store_registry import StoreRegistry
+
+    _, _, producer, cfg = svc
+    reg = StoreRegistry(tmp_path, multi=True)
+    s = GroupService(cfg, None, producer, SeqMinter(), stores=reg)
+    gid, _ = s.create(label="batch", expected=2, userkey="gh-alice-a1b2c3d4")
+    corr = s.submit_members(gid, ["a"], userkey="gh-alice-a1b2c3d4")[0]
+
+    forged = member_event(gid, corr, final=True, phase="result",
+                          userkey="gh-alice-a1b2c3d4")
+    # The row is where the intact frame would look for it:
+    assert reg.for_event(forged).group_of(corr) is not None
+    del forged["userkey"]          # -> shared/, where the membership row is not
+
+    n = RecordingNtfy(None, stores=reg)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "dropping ce_userkey must not buy a push either"
 
 
 def test_member_errors_can_be_surfaced_by_config(svc):

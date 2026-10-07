@@ -197,18 +197,42 @@ class NtfyPublisher(threading.Thread):
         The counting was never wrong (duplicates are ignored, completion fires once);
         only the notification policy was. A batch is two notifications, at its edges,
         for the whole life of the group.
+
+        **Membership is read from the store, not off the event.** Deciding on the
+        event's own `ce_groupid` meant a forged frame that simply OMITTED the attribute
+        was not a group member as far as this check was concerned: it was pushed, stored
+        in the member's transcript, and a forged terminal frame paged at priority 5 even
+        with `NTFY_GROUP_NOTIFY_ERRORS` off, while the batch's own arithmetic disagreed
+        with the notification the operator had just received. This is reachable with
+        signing fully enforced, because it is a routing decision on an attacker-supplied
+        attribute rather than a signature check. `DESIGN_PHASE2.md` §8.5.4 states the
+        general rule: if the decision reads an attribute off the event, the forger
+        controls it — including by leaving it out. So resolve the correlation id's group
+        from `group_members`, which the forger does not supply.
+
+        **Scope: the omission case is closed for single-tenant only.** In multi-tenant
+        mode the store this row is looked up in is itself chosen by `ce_userkey`, which
+        the forger also controls — a frame that keeps `ce_groupid` but omits `ce_userkey`
+        routes to `shared/`, where the membership row is not, and escapes suppression
+        exactly as before. Closing that means resolving the store from the ownership
+        index rather than the event; #904 tracks it.
         """
-        groupid = event.get("groupid")
         store = self._store_for(event)
-        if not groupid or store is None:
+        if store is None:
             return False
         if self._cfg.group_notify_errors and event.get("phase") == "error":
             return False
         try:
-            # An unknown groupid is treated as ungrouped: if we have no group row we
-            # will never send group notifications either, so suppressing would mean
-            # sending nothing at all. Routed by the event's own userkey for the same
-            # reason as the body lookup — the group row is in its owner's store.
+            # Routed by the event's own userkey for the same reason as the body lookup —
+            # the group row is in its owner's store.
+            corr = event.get("correlationid")
+            groupid = store.group_of(corr) if corr else None
+            if groupid is None:
+                # Genuinely ungrouped, or a correlation id we have never seen: notify.
+                # An unknown group is treated as ungrouped because we will never send
+                # group notifications for it either, so suppressing would mean sending
+                # nothing at all.
+                return False
             return store.get_group(groupid) is not None
         except Exception:  # noqa: BLE001
             return False
