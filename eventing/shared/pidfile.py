@@ -3,7 +3,7 @@
 `PidFile(name)` writes `${TMPDIR}/rossoctl-keda1/<name>.pid` on __enter__, removes
 it on __exit__. Refuses to start if the file exists and points at a live process
 (unless RUN_FORCE=1 is set in the env). Stale PID files (process gone, or naming
-our own PID) are silently reclaimed.
+our own PID) are reclaimed, with a line on stdout saying so.
 """
 from __future__ import annotations
 
