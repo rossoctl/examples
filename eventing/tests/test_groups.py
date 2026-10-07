@@ -452,6 +452,13 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
     completes: KEDA scales a pod down, its offset was never committed, Kafka redelivers
     the request and the agent re-runs. Suppression keyed on "group still open" let every
     one of those through. Membership is the correct key.
+
+    A redelivery is always a RECORDED member: both submission paths call
+    `add_group_member` before publishing the request, precisely so a fast agent's
+    terminal event can be attributed, and `on_member_event` records membership again on
+    arrival -- ahead of the ntfy fan-out, which `kafka_in.run()` invokes afterwards. So
+    reading membership from the store rather than from `ce_groupid` suppresses
+    redeliveries exactly as before.
     """
     s, store, _, _ = svc
     gid, _ = s.create(label="batch", expected=1)
@@ -461,8 +468,14 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
 
     n = RecordingNtfy(store)
     n.submit_and_drain(member_event(gid, corr, final=True, phase="result"))
-    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
     assert n.sent == [], "a batch is two notifications, not two plus its redeliveries"
+
+    # A correlation id that is NOT a recorded member but claims the group is a different
+    # case, and deliberately notifies now -- see
+    # test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member.
+    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
+    assert len(n.sent) == 1, \
+        "an unrecorded correlation id is not silenced by the groupid it asserts"
 
 
 def test_a_hundred_members_produce_exactly_two_notifications(svc):
@@ -491,6 +504,65 @@ def test_an_ungrouped_agent_still_notifies(svc):
     n.submit_and_drain({"correlationid": "solo", "phase": "result", "final": "true",
                         "data": {"text": "hi"}})
     assert len(n.sent) == 1
+
+
+def test_a_member_event_without_a_groupid_is_still_suppressed(svc):
+    """The forger controls every attribute on the event -- including by leaving it out.
+
+    Suppression used to read `ce_groupid` off the event, so a frame that simply OMITTED
+    it was not a group member as far as the check was concerned: it was pushed, stored
+    in the member's transcript and shown on the group page. `DESIGN_PHASE2.md` §8.5.4
+    states the rule this is an instance of -- prefer deciding on state the attacker does
+    not supply: group membership from the store, not the groupid on the frame.
+
+    Reachable even with signing fully enforced, because this is a routing decision on
+    an attacker-supplied attribute, not a signature check.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="result")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "membership comes from group_members, not from the frame"
+
+
+def test_a_forged_terminal_frame_without_a_groupid_does_not_page(svc):
+    """The sharper edge of the same hole: a terminal frame reaches `_publish` as an
+    error, which pages at priority 5 even with NTFY_GROUP_NOTIFY_ERRORS off -- and does
+    not count the member as failed, so the batch's own arithmetic disagreed with the
+    notification the operator had just received."""
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="error")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store, notify_errors=False)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "a member's error must stay suppressed while errors are off"
+
+
+def test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member(svc):
+    """The converse, and the reason the fix is not simply "read both".
+
+    An event asserting a `ce_groupid` it is not a recorded member of must not be able to
+    silence itself by that assertion. Legitimate members are always recorded first --
+    both submission paths call `add_group_member` before publishing -- so only a forgery
+    reaches here unrecorded.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    s.submit_members(gid, ["a"])
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(member_event(gid, "never-submitted-0001",
+                                    final=True, phase="result"))
+    assert len(n.sent) == 1, "the groupid on the frame cannot buy silence"
 
 
 def test_member_errors_can_be_surfaced_by_config(svc):
