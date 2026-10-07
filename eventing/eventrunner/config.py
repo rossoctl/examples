@@ -188,11 +188,19 @@ def load() -> Cfg:
     # sets `kev1-requests`) and renaming alone is not a tenancy signal.
     embedded = tenancy.userkey_in_topic(cfg.request_topic)
     if embedded is not None and embedded != cfg.userkey:
+        # Two distinct faults share this exit, and the message names which one: an
+        # unset ER_USERKEY (the runner stamps nothing) and one that disagrees with the
+        # topic (the runner stamps the wrong tenant). Saying "is required" for the
+        # second would be wrong — it was supplied, it just names someone else.
+        problem = ("ER_USERKEY is required when REQUEST_TOPIC is a per-user topic"
+                   if not cfg.userkey else
+                   f"ER_USERKEY must match the userkey embedded in REQUEST_TOPIC, "
+                   f"but names {cfg.userkey!r}")
         raise SystemExit(
-            f"ER_USERKEY is required when REQUEST_TOPIC is a per-user topic "
-            f"(got {cfg.request_topic!r}, whose embedded userkey is "
-            f"{embedded!r}). A runner that stamps no userkey on its "
-            f"responses produces events EventBridge cannot attribute. "
+            f"{problem} (got {cfg.request_topic!r}, whose embedded userkey is "
+            f"{embedded!r}). A runner that stamps no userkey — or the wrong one — on "
+            f"its responses produces events EventBridge cannot attribute, or files "
+            f"them in another user's store. "
             f"See DESIGN_PHASE3.md §3.3.")
 
     base = e("TMPDIR", "/tmp").rstrip("/")

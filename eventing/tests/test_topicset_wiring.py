@@ -187,12 +187,21 @@ def test_the_runner_refuses_a_per_user_topic_without_a_userkey(monkeypatch):
 
 def test_the_runner_refuses_a_per_user_topic_with_a_mismatched_userkey(monkeypatch):
     """The topic embeds one tenant; ER_USERKEY names another. Attributing the
-    responses to the named one would file them in the wrong store — refuse."""
+    responses to the named one would file them in the wrong store — refuse.
+
+    The message must not say "is required": it *was* supplied, it just names
+    someone else, and an operator told a set variable is missing looks in the
+    wrong place. Both the supplied and the embedded key are named so the
+    rendering bug is diagnosable from the exit line alone."""
     from eventrunner import config as ercfg
     monkeypatch.setenv("REQUEST_TOPIC", f"kev1-{UK}-requests")
     monkeypatch.setenv("ER_USERKEY", "gh-alice-00000000")
-    with pytest.raises(SystemExit, match="ER_USERKEY is required"):
+    with pytest.raises(SystemExit, match="ER_USERKEY must match") as exc:
         ercfg.load()
+    msg = str(exc.value)
+    assert "is required" not in msg
+    assert "gh-alice-00000000" in msg   # what the operator set
+    assert UK in msg                    # what the topic says it should be
 
 
 def test_the_runner_accepts_a_renamed_single_tenant_topic_without_a_userkey(monkeypatch):
