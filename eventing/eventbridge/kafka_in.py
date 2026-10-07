@@ -73,12 +73,24 @@ class Consumer(threading.Thread):
         self._require_sig = require_signature
         self._bridge_kid = bridge_kid
         self._rejected = 0
+        self._audit_failed = 0
         self._stopping = threading.Event()
 
     @property
     def rejected(self) -> int:
         """Responses stored as phase=error because they did not verify."""
         return self._rejected
+
+    @property
+    def audit_failed(self) -> int:
+        """Responses accepted unchanged that enforcement *would* have rejected.
+
+        This is the reject rate the two-flag rollout asks an operator to watch: with a
+        keyset configured and `EB_REQUIRE_RESPONSE_SIGNATURE=false`, it counts what
+        turning enforcement on would start refusing. Stays 0 once enforcement is on,
+        because then those events land in `rejected` instead.
+        """
+        return self._audit_failed
 
     def stop(self) -> None:
         self._stopping.set()
@@ -106,10 +118,10 @@ class Consumer(threading.Thread):
                     # here ends the for, ends the while, and the thread is gone — while
                     # the process stays up and the pod still reports healthy. The
                     # verification path must degrade, never raise.
-                    ok, why = True, "not checked"
+                    ok, why, verified = True, "not checked", True
                     if self._keyset is not None:
                         try:
-                            ok, why = signing.response_decision(
+                            ok, why, verified = signing.response_decision(
                                 evt, self._keyset, require=self._require_sig,
                                 bridge_kid=self._bridge_kid)
                         except Exception as e:  # noqa: BLE001
@@ -117,8 +129,19 @@ class Consumer(threading.Thread):
                             # itself is broken, an unverifiable event is not evidence of
                             # anything, and silently accepting it defeats the control.
                             ok, why = (not self._require_sig), f"verifier raised: {e!r}"
+                            verified = False
                             print(f"[kafka_in] verification error: {e!r}")
                     d = ce.envelope_dict(evt)
+                    if ok and not verified and self._keyset is not None:
+                        # Audit mode: the event is stored unchanged, and this line plus
+                        # the counter are the only trace that enforcement would have
+                        # refused it. §4.4's two-flag rollout ("a keyset alone verifies
+                        # and logs") is unperformable without them -- the verdict was
+                        # computed and the reason discarded, so there was no reject rate
+                        # to watch before turning enforcement on.
+                        self._audit_failed += 1
+                        print(f"[kafka_in] audit: would reject response on "
+                              f"{d.get('correlationid') or d.get('groupid')}: {why}")
                     if not ok:
                         self._rejected += 1
                         print(f"[kafka_in] unverified response on "

@@ -441,8 +441,8 @@ def _is_terminal(event) -> bool:
 
 
 def response_decision(event, ks, *, require: bool,
-                      bridge_kid: str | None = None) -> tuple[bool, str]:
-    """(accept_as_is, reason) for one event off the responses topic.
+                      bridge_kid: str | None = None) -> tuple[bool, str, bool]:
+    """(accept_as_is, reason, verified) for one event off the responses topic.
 
     Pure: no I/O, no logging, and **it does not touch `event`** — the caller owns the
     rewrite, which is what makes this testable without a Kafka consumer.
@@ -450,12 +450,25 @@ def response_decision(event, ks, *, require: bool,
     Collapsing three questions into one answer is deliberate; it leaves the caller no
     policy to get wrong:
 
-    * `ks is None` — verification is not configured. Accept, as today.
-    * verified — accept.
+    * `ks is None` — verification is not configured. Accept, as today; `verified` is
+      False, because nothing was checked.
+    * verified — accept, `verified` True.
     * not verified and `require` false — **audit mode**: accept, but hand back the
       reason so the caller can log it. Enforcement rewrites persisted rows and pages
       a phone, so there has to be a way to watch the reject rate first.
     * not verified and `require` true — reject; the caller stores it as `phase=error`.
+
+    **`verified` is the third element rather than something the caller infers from
+    `reason`.** Audit mode and a clean verification both return `accept=True`, so
+    telling them apart was only possible by matching the reason prose — which exists to
+    be read by a human in a log line, not parsed. A caller that wants to count what
+    *would* have been rejected reads this flag.
+
+    So, with a keyset configured, `accept and not verified` is exactly the audit-mode
+    population: the events enforcement would have refused. The unsigned non-terminal
+    passthrough reports `verified=True` because it is accepted by policy rather than in
+    spite of a failure, and `ks is None` reports False but is excluded by the caller's
+    own "is a keyset configured" check.
 
     `bridge_kid` pins group lifecycle events to EventBridge's own key. It is only
     applied when set, so a single-key deployment — where `KeySet.select(None)` returns
@@ -473,14 +486,18 @@ def response_decision(event, ks, *, require: bool,
     masquerade as the result.
     """
     if ks is None:
-        return True, "verification not enabled"
+        return True, "verification not enabled", False
     expect = bridge_kid if (bridge_kid and ce.is_group_event(event)) else None
     ok, why = verify_with_keyset(event, ks, expect_kid=expect)
     if ok:
-        return True, why
+        return True, why, True
     if not event.get("signature") and not _is_terminal(event):
-        return True, "unsigned non-terminal frame (signing covers terminal events)"
-    return (not require), why
+        # `verified=True` because this frame is accepted by the signing policy, not in
+        # spite of it: nothing was expected to be signed, so nothing failed. A caller
+        # counting audit-mode failures must not count the streamed frames of every
+        # genuine run, which is what the policy below makes unsigned on purpose.
+        return True, "unsigned non-terminal frame (signing covers terminal events)", True
+    return (not require), why, False
 
 
 # ---- key loading ------------------------------------------------------------
