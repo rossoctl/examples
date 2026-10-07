@@ -240,19 +240,23 @@ def test_single_mode_inbox_and_dead_are_derived_from_the_prefix():
 
 # ---- userkey_in_topic ------------------------------------------------------
 
-def test_userkey_in_topic_round_trips_topicset():
-    """The inverse of `TopicSet`'s derivation: whatever the topic layout produces,
-    `userkey_in_topic` must recognise the key back out of it."""
+def test_userkey_in_topic_recognises_topicset_names_as_per_user():
+    """`TopicSet`'s four per-user names are recognised as per-user. The captured key
+    is deliberately not asserted — see the ambiguity test below."""
     uk = T.userkey("github", "Mrsabath")
     ts = T.TopicSet("kev1", tenancy=T.MULTI)
     for method in (ts.requests, ts.responses, ts.events, ts.dead):
-        assert T.userkey_in_topic(method(uk)) == uk
+        assert T.userkey_in_topic(method(uk)) is not None
+        assert T.topic_names_userkey(method(uk), uk)
 
 
 @pytest.mark.parametrize("suffix", ["requests", "responses", "events", "dead"])
 def test_userkey_in_topic_recognises_each_suffix(suffix):
+    """Recognition only — the split's captured key is not asserted, per the
+    ambiguity test below."""
     uk = T.userkey("oidc", "alice@example.com")
-    assert T.userkey_in_topic(f"kev1-{uk}-{suffix}") == uk
+    assert T.userkey_in_topic(f"kev1-{uk}-{suffix}") is not None
+    assert T.topic_names_userkey(f"kev1-{uk}-{suffix}", uk)
 
 
 def test_userkey_in_topic_returns_none_for_single_tenant_names():
