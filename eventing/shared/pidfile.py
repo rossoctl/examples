@@ -2,8 +2,8 @@
 
 `PidFile(name)` writes `${TMPDIR}/rossoctl-keda1/<name>.pid` on __enter__, removes
 it on __exit__. Refuses to start if the file exists and points at a live process
-(unless RUN_FORCE=1 is set in the env). Stale PID files (process gone) are
-silently reclaimed.
+(unless RUN_FORCE=1 is set in the env). Stale PID files (process gone, or naming
+our own PID) are reclaimed, with a line on stdout saying so.
 """
 from __future__ import annotations
 
@@ -44,7 +44,15 @@ class PidFile:
                 existing = int(self._path.read_text().strip() or "0")
             except ValueError:
                 existing = 0
-            if existing and _pid_alive(existing):
+            if existing == os.getpid():
+                # We have not written this file yet, so our own PID in it means the
+                # previous process died abruptly and the restarted one was handed the
+                # same PID. In a container that is every restart: the process is PID 1,
+                # `_pid_alive(1)` is True because PID 1 is the caller itself, and the
+                # guard below would refuse to start forever ("already running as pid 1").
+                print(f"[{self._name}] reclaimed stale pidfile naming our own pid"
+                      f" {existing}: {self._path}")
+            elif existing and _pid_alive(existing):
                 if os.environ.get("RUN_FORCE") != "1":
                     raise SystemExit(
                         f"[{self._name}] already running as pid {existing}"
