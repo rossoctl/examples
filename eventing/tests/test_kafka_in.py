@@ -343,6 +343,72 @@ def test_a_verifier_that_raises_fails_open_when_not_enforcing(tmp_path, monkeypa
     assert len(seen) == 1
     assert c.rejected == 0
     assert store.events_for("brave-otter-4718")[0]["phase"] == "result"
+    assert c.audit_failed == 1, \
+        "but it is still an unverified acceptance, and audit mode exists to count those"
+
+
+# ---- audit mode: the reject rate the rollout asks you to watch ---------------
+
+def test_audit_mode_counts_and_logs_what_enforcement_would_reject(
+        tmp_path, monkeypatch, capsys):
+    """§4.4 promises "a keyset alone verifies and logs while storing events unchanged",
+    and that is the step where an operator watches the reject rate before enforcing.
+
+    The verdict was computed and the reason discarded, so nothing surfaced it: no log
+    line, no counter, and therefore no reject rate to watch. The rollout the design
+    documents could not be performed.
+    """
+    c, store, seen, _ = _drain(tmp_path, [_response()], monkeypatch,
+                               keyset=_keyset(tmp_path), require_signature=False)
+    assert c.audit_failed == 1, "the unsigned terminal response must be counted"
+    assert c.rejected == 0, "but audit mode rejects nothing"
+
+    # Stored unchanged is the other half of the promise: audit mode observes without
+    # rewriting the row a user reads.
+    rows = store.events_for("brave-otter-4718")
+    assert rows[0]["phase"] == "result"
+    assert "signature_rejected" not in (rows[0].get("data") or {})
+    assert len(seen) == 1
+
+    out = capsys.readouterr().out
+    assert "audit: would reject response on brave-otter-4718" in out
+    assert "no ce_signature" in out, "the reason is what makes the line actionable"
+
+
+def test_audit_mode_stays_quiet_for_responses_that_verify(tmp_path, monkeypatch):
+    """A counter that also counts successes is not a reject rate."""
+    c, _, _, _ = _drain(tmp_path, [_response(seed=SEED_R1, kid="runner-01")],
+                        monkeypatch, keyset=_keyset(tmp_path),
+                        require_signature=False)
+    assert c.audit_failed == 0 and c.rejected == 0
+
+
+def test_audit_mode_does_not_count_unsigned_non_terminal_frames(tmp_path, monkeypatch):
+    """`emit()` signs terminal events only, so every streamed frame of every genuine
+    run is unsigned on purpose. Counting those would bury the signal this exists for."""
+    c, _, _, _ = _drain(tmp_path,
+                        [_response(seq=1, phase="stdout", final="false", text="thinking")],
+                        monkeypatch, keyset=_keyset(tmp_path),
+                        require_signature=False)
+    assert c.audit_failed == 0, "accepted by the signing policy, not a failed check"
+
+
+def test_the_audit_counter_stays_zero_once_enforcement_is_on(tmp_path, monkeypatch):
+    """The two counters partition the population rather than double-counting it: with
+    enforcement on, a forgery lands in `rejected`, which is the observable that already
+    existed."""
+    c, _, _, _ = _drain(tmp_path, [_response()], monkeypatch,
+                        keyset=_keyset(tmp_path), require_signature=True)
+    assert c.rejected == 1 and c.audit_failed == 0
+
+
+def test_no_audit_logging_when_verification_is_not_configured(
+        tmp_path, monkeypatch, capsys):
+    """The default deployment has no keyset. Nothing was checked, so there is nothing
+    to report, and an unconfigured bridge must not log a line per event."""
+    c, _, _, _ = _drain(tmp_path, [_response()], monkeypatch)
+    assert c.audit_failed == 0
+    assert "audit:" not in capsys.readouterr().out
 
 
 def test_an_undecodable_record_still_ends_the_loop_as_before(tmp_path, monkeypatch):

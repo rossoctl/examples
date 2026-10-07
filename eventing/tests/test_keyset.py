@@ -402,21 +402,25 @@ def test_expect_kid_pins_the_signer_to_one_identity(tmp_path):
 # ---- response_decision: enabled? verified? enforced? -------------------------
 
 def test_response_decision_accepts_everything_when_no_keyset_is_configured():
-    """Today's behaviour, which must survive untouched as the default."""
-    ok, why = S.response_decision(_event(), None, require=True)
-    assert ok and "not enabled" in why
+    """Today's behaviour, which must survive untouched as the default. `verified=True`
+    here is the same reading as the unsigned non-terminal passthrough: nothing being
+    configured to check is an acceptance by policy, not a failed check — so
+    `accept and not verified` stays the audit-mode population with no caller-side
+    keyset guard."""
+    ok, why, verified = S.response_decision(_event(), None, require=True)
+    assert ok and verified and "not enabled" in why
 
 
 def test_response_decision_accepts_a_verified_response(tmp_path):
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
     e = _event()
     S.sign_into(e, SEED, "runner-01")
-    assert S.response_decision(e, ks, require=True) == (True, "ok")
+    assert S.response_decision(e, ks, require=True) == (True, "ok", True)
 
 
 def test_response_decision_rejects_an_unsigned_response_when_enforcing(tmp_path):
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
-    ok, why = S.response_decision(_event(), ks, require=True)
+    ok, why, verified = S.response_decision(_event(), ks, require=True)
     assert not ok and "no ce_signature" in why
 
 
@@ -424,9 +428,12 @@ def test_response_decision_reports_but_accepts_in_audit_mode(tmp_path):
     """The two-flag rollout in one assertion: a keyset alone verifies and explains,
     without yet rewriting anything a user sees."""
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
-    ok, why = S.response_decision(_event(), ks, require=False)
+    ok, why, verified = S.response_decision(_event(), ks, require=False)
     assert ok, "audit mode must not reject"
     assert "no ce_signature" in why, "but it must still say what was wrong"
+    assert not verified, \
+        "and it must be distinguishable from a clean pass, which is what makes the " \
+        "reject rate countable without parsing the reason prose"
 
 
 def test_response_decision_requires_the_bridge_kid_on_group_events(tmp_path):
@@ -434,7 +441,7 @@ def test_response_decision_requires_the_bridge_kid_on_group_events(tmp_path):
                                        "runner-01": PUB2.hex()}))
     forged = _event(type=ce.TYPE_GROUP_COMPLETED)
     S.sign_into(forged, SEED2, "runner-01")
-    ok, why = S.response_decision(forged, ks, require=True, bridge_kid="eventbridge")
+    ok, why, verified = S.response_decision(forged, ks, require=True, bridge_kid="eventbridge")
     assert not ok and "expected a signature from kid 'eventbridge'" in why
 
     # A plain response from that same runner is still fine — the pin is per-class.
@@ -453,16 +460,19 @@ def test_an_unsigned_non_terminal_frame_is_accepted(tmp_path):
     """
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
     frame = _event(sequence=1, phase="stdout", final="false")
-    ok, why = S.response_decision(frame, ks, require=True)
+    ok, why, verified = S.response_decision(frame, ks, require=True)
     assert ok, why
     assert "non-terminal" in why
+    assert verified, \
+        "accepted by policy, not in spite of a failure — otherwise an audit-mode " \
+        "counter would log every streamed frame of every genuine run"
 
 
 def test_an_unsigned_terminal_response_is_still_rejected(tmp_path):
     """The line the exemption must not cross: the terminal event is the one the
     transcript presents as the answer, so refusing it unsigned is the whole control."""
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
-    ok, why = S.response_decision(_event(phase="result", final="true"), ks, require=True)
+    ok, why, verified = S.response_decision(_event(phase="result", final="true"), ks, require=True)
     assert not ok and "no ce_signature" in why
 
 
@@ -472,7 +482,7 @@ def test_a_non_terminal_frame_that_claims_a_signature_is_still_verified(tmp_path
     ks = keyset.load(_write(tmp_path, {"runner-01": PUB.hex()}))
     frame = _event(sequence=1, phase="stdout", final="false")
     S.sign_into(frame, SEED2, "runner-01")          # approved kid, wrong key
-    ok, why = S.response_decision(frame, ks, require=True)
+    ok, why, verified = S.response_decision(frame, ks, require=True)
     assert not ok and "does not verify" in why
 
 
@@ -484,7 +494,7 @@ def test_an_unsigned_group_event_is_rejected_despite_having_no_final_attribute(t
     grp = _event(type=ce.TYPE_GROUP_COMPLETED, groupid="g-1")
     grp.attrs.pop("final", None)
     assert "final" not in grp.attrs
-    ok, why = S.response_decision(grp, ks, require=True, bridge_kid="eventbridge")
+    ok, why, verified = S.response_decision(grp, ks, require=True, bridge_kid="eventbridge")
     assert not ok and "no ce_signature" in why
 
 
