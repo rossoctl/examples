@@ -209,6 +209,13 @@ class NtfyPublisher(threading.Thread):
         general rule: if the decision reads an attribute off the event, the forger
         controls it — including by leaving it out. So resolve the correlation id's group
         from `group_members`, which the forger does not supply.
+
+        **Scope: the omission case is closed for single-tenant only.** In multi-tenant
+        mode the store this row is looked up in is itself chosen by `ce_userkey`, which
+        the forger also controls — a frame that keeps `ce_groupid` but omits `ce_userkey`
+        routes to `shared/`, where the membership row is not, and escapes suppression
+        exactly as before. Closing that means resolving the store from the ownership
+        index rather than the event; #904 tracks it.
         """
         store = self._store_for(event)
         if store is None:
