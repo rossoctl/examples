@@ -238,6 +238,48 @@ def test_single_mode_inbox_and_dead_are_derived_from_the_prefix():
     assert ts.dead() == "kev1-dead"
 
 
+# ---- userkey_in_topic ------------------------------------------------------
+
+def test_userkey_in_topic_round_trips_topicset():
+    """The inverse of `TopicSet`'s derivation: whatever the topic layout produces,
+    `userkey_in_topic` must recognise the key back out of it."""
+    uk = T.userkey("github", "Mrsabath")
+    ts = T.TopicSet("kev1", tenancy=T.MULTI)
+    for method in (ts.requests, ts.responses, ts.events, ts.dead):
+        assert T.userkey_in_topic(method(uk)) == uk
+
+
+@pytest.mark.parametrize("suffix", ["requests", "responses", "events", "dead"])
+def test_userkey_in_topic_recognises_each_suffix(suffix):
+    uk = T.userkey("oidc", "alice@example.com")
+    assert T.userkey_in_topic(f"kev1-{uk}-{suffix}") == uk
+
+
+def test_userkey_in_topic_returns_none_for_single_tenant_names():
+    """A renamed default is not a tenancy signal — this is the case the runner's
+    old refusal got wrong, refusing to boot `k8s/base/configmap.yaml`'s
+    `REQUEST_TOPIC: kev1-requests`."""
+    assert T.userkey_in_topic("requests") is None
+    assert T.userkey_in_topic("kev1-requests") is None
+    assert T.userkey_in_topic("kev1-kev1-requests") is None
+    assert T.userkey_in_topic("") is None
+    assert T.userkey_in_topic(None) is None
+
+
+def test_userkey_in_topic_requires_a_per_user_suffix():
+    uk = T.userkey("github", "Mrsabath")
+    assert T.userkey_in_topic(f"kev1-{uk}") is None
+    assert T.userkey_in_topic(f"kev1-{uk}-other") is None
+
+
+def test_userkey_in_topic_rejects_names_that_are_not_userkey_products():
+    """The embedded component must have the `userkey()` shape — anything else is a
+    coincidence of dashes, not a tenant."""
+    assert T.userkey_in_topic("kev1-shared-requests") is None
+    assert T.userkey_in_topic("kev1-GH-MRSABATH-4C1D9E07-requests") is None
+    assert T.userkey_in_topic("kev1-gh-alice-notahex-requests") is None
+
+
 # ---- ntfy_topic ------------------------------------------------------------
 
 SECRET = b"a-test-ntfy-topic-secret"

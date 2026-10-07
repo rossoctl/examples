@@ -162,8 +162,15 @@ def userkey(issuer: str, userid: str) -> str:
 #
 # The slug is at most _SLUG_MAX characters, starts with an alphanumeric (`_slug` strips
 # leading dashes) and contains only `[a-z0-9-]`.
-USERKEY_RE = re.compile(
-    rf"^[a-z]{{2}}-[a-z0-9][a-z0-9-]{{0,{_SLUG_MAX - 1}}}-[0-9a-f]{{{_DIGEST_HEX}}}$")
+_USERKEY_CORE = rf"[a-z]{{2}}-[a-z0-9][a-z0-9-]{{0,{_SLUG_MAX - 1}}}-[0-9a-f]{{{_DIGEST_HEX}}}"
+USERKEY_RE = re.compile(rf"^{_USERKEY_CORE}$")
+
+# A per-user topic name, `{prefix}-{userkey}-{suffix}` (§3.1): the prefix agrees with
+# EventBridge's `EB_TOPIC_PREFIX` validation and the suffixes are `TopicSet`'s four.
+# `userkey_in_topic` uses it to recognise — not interpret — a per-user topic on the
+# runner side, where the topic arrives as a bare string with no TopicSet in hand.
+PER_USER_TOPIC_RE = re.compile(
+    rf"^[a-zA-Z0-9-]{{1,32}}?-(?P<userkey>{_USERKEY_CORE})-(?:requests|responses|events|dead)$")
 
 
 def is_valid_userkey(value: str | None) -> bool:
@@ -190,6 +197,30 @@ def is_valid_userkey(value: str | None) -> bool:
     userkey` check straight into the join.
     """
     return bool(value) and bool(USERKEY_RE.fullmatch(value))
+
+
+def userkey_in_topic(topic: str | None) -> str | None:
+    """The userkey a per-user topic name embeds, or `None` if it embeds none.
+
+    A per-user topic is `{prefix}-{userkey}-{suffix}` (§3.1) and `userkey` itself
+    contains `-`, so the name cannot be split — the key has to be found by shape.
+    This is the inverse of `TopicSet.requests(userkey)` and lives next to
+    `is_valid_userkey` for the same reason: this module is the only place an
+    identity becomes a name, so recognising one inside a name belongs here too.
+
+    `None` is the answer for every single-tenant topic — including renamed defaults
+    like `kev1-requests` — because a renamed default is not a tenancy signal. The
+    caller decides what a per-user name without a matching key means; here it is
+    just "this is not a per-user topic".
+
+    False negatives are safe here: the runner's refusal is a deployment guard, not
+    the last line of defense — EventBridge's `StoreRegistry.for_event` is what
+    actually files or rejects a response, and it counts rather than guesses.
+    """
+    if not topic:
+        return None
+    m = PER_USER_TOPIC_RE.fullmatch(topic)
+    return m.group("userkey") if m else None
 
 
 def ntfy_topic(prefix: str, userkey: str, secret: bytes) -> str:

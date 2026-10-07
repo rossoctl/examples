@@ -172,7 +172,7 @@ Highlights, each re-measuring something the design had asserted:
 | Concurrency (T1.10) | ≤ partition count | peak **4** replicas for 3 correlations |
 | Image pull | 5.1 s cold (245 MB) | 454 ms – 2.45 s warm |
 | Rebalance floor (Gap A) | ~3 s | consistent with the 5.0 s total |
-| Ed25519 sign / verify | not estimated | **222 ms / 227 ms** — see §6 |
+| Ed25519 sign / verify | not estimated | **222 ms / 227 ms** — see §9 |
 
 ---
 

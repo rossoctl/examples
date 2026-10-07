@@ -694,9 +694,11 @@ Two limits worth stating plainly:
   `/continue` stay open by design — `/continue` because authenticating it would
   put a long-lived bearer token inside every ntfy notification; it relies on the
   unguessable `correlationid` as a capability URL instead.
-- `submitter` is **not signed**, and Kafka is plaintext. The claim is "EventBridge
-  refuses unauthenticated submissions and records who it believes submitted this",
-  not "this event proves who submitted it."
+- `submitter` is signed (it joined `signing.SIGNED_ATTRS` in Phase 2, DESIGN_PHASE2
+  §4.2), and Kafka is still plaintext. The claim is "EventBridge refuses
+  unauthenticated submissions and records who it believes submitted this — and on a
+  signed request, the signature proves EventBridge asserted that name", not "this
+  event proves who typed it."
 
 Setting `EB_AUTH_TOKENS` will 401 the `/eventbridge` CLI, the three e2e scripts
 and the README `curl`s until they are taught to send the header.
@@ -718,8 +720,10 @@ rm /tmp/seed.hex
 
 Signing is implemented in pure Python (`cryptography` is a C extension and
 banned), verified against the RFC 8032 test vectors. It is off by default partly
-because the pure-Python scalar multiplication costs roughly 100 ms per
-sign/verify, which is real per-event overhead — see `IMPLEMENTATION_REPORT1.md`.
+because the pure-Python scalar multiplication is real per-event overhead:
+IMPLEMENTATION_REPORT1.md §9 measured **222 ms to sign and 227 ms to verify** on
+the reference laptop, and later hardware has measured inside a 190–230 ms band —
+fine for the terminal event, wrong for every intermediate one.
 
 ---
 

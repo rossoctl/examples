@@ -107,7 +107,7 @@ def cmd_cont(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="op", required=True)
-    r = sub.add_parser("run");    r.add_argument("prompt"); r.add_argument("--max-turns", type=int, default=3); r.add_argument("--watch", action="store_true", default=True); r.set_defaults(fn=cmd_run)
+    r = sub.add_parser("run");    r.add_argument("prompt"); r.add_argument("--max-turns", type=int, default=3); r.add_argument("--watch", action=argparse.BooleanOptionalAction, default=True); r.set_defaults(fn=cmd_run)
     w = sub.add_parser("watch");  w.add_argument("correlationid"); w.set_defaults(fn=cmd_watch)
     c = sub.add_parser("cont");   c.add_argument("correlationid"); c.add_argument("prompt"); c.set_defaults(fn=cmd_cont)
     args = p.parse_args(); args.fn(args)

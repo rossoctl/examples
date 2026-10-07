@@ -15,7 +15,8 @@ class Producer:
     signed input — it cannot be swapped to impersonate another key.
 
     **Cost.** The Ed25519 here is pure Python (`cryptography` is a C extension and is
-    banned by §1.1) and takes ~150-200 ms per signature. `publish_request` is called
+    banned by §1.1) and takes 190-230 ms per signature (measured: 222 ms sign / 227 ms
+    verify, IMPLEMENTATION_REPORT1 §9). `publish_request` is called
     once per group member by `GroupService.submit_members`, in a loop, inside one HTTP
     request — so a 100-member batch spends ~20 s signing while the caller waits. That
     is accepted: a batch launch is an operator action, not a hot path. It is recorded

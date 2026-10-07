@@ -6,6 +6,8 @@ import pathlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from shared import tenancy
+
 # Env vars that carry an Anthropic credential. Their presence is what decides
 # whether we default to real `claude` or to mock mode — a container with no key
 # would otherwise spawn claude only to have it fail on auth, turning every
@@ -110,9 +112,10 @@ class Cfg:
     # §3.3 — which tenant this runner serves. Stamped on every response as
     # `ce_userkey`, which is what lets EventBridge file the response in the right
     # store. Empty is single-tenant mode (the default, = Phase 2). Required once
-    # REQUEST_TOPIC is not the default: a runner that stamps no userkey produces
-    # events EventBridge cannot attribute, and a silent default here would route one
-    # user's output into another user's store. `load` enforces that, loudly.
+    # REQUEST_TOPIC is a per-user topic naming a different userkey: a runner that
+    # stamps no userkey produces events EventBridge cannot attribute, and a silent
+    # default here would route one user's output into another user's store. `load`
+    # enforces that, loudly.
     userkey: str = ""
 
     # §5.2 — where baked AgentSpecs live. A directory in the image, not a mount:
@@ -175,14 +178,20 @@ def load() -> Cfg:
     cfg.userkey    = (e("ER_USERKEY") or "").strip()
     cfg.agent_dir  = e("ER_AGENT_DIR",  cfg.agent_dir)
     cfg.agent_name = e("ER_AGENT_NAME", cfg.agent_name)
-    # A per-user runner is pointed at a per-user topic, so a non-default REQUEST_TOPIC
-    # with no ER_USERKEY means the deployment was rendered wrong. Refusing to start is
-    # the only safe direction: the alternative is responses EventBridge files into the
-    # `shared` store or drops, which looks exactly like an agent that never answered.
-    if cfg.request_topic != Cfg.request_topic and not cfg.userkey:
+    # A per-user runner is pointed at a per-user topic, so a REQUEST_TOPIC that embeds
+    # a userkey with no matching ER_USERKEY means the deployment was rendered wrong.
+    # Refusing to start is the only safe direction: the alternative is responses
+    # EventBridge files into the `shared` store or drops, which looks exactly like an
+    # agent that never answered. The check keys on the per-user topic shape
+    # (`{prefix}-{userkey}-requests`, §3.1) rather than on "not the default name":
+    # single-tenant deployments rename the default freely (the shipped K8s configmap
+    # sets `kev1-requests`) and renaming alone is not a tenancy signal.
+    embedded = tenancy.userkey_in_topic(cfg.request_topic)
+    if embedded is not None and embedded != cfg.userkey:
         raise SystemExit(
-            f"ER_USERKEY is required when REQUEST_TOPIC is not {Cfg.request_topic!r} "
-            f"(got {cfg.request_topic!r}). A runner that stamps no userkey on its "
+            f"ER_USERKEY is required when REQUEST_TOPIC is a per-user topic "
+            f"(got {cfg.request_topic!r}, whose embedded userkey is "
+            f"{embedded!r}). A runner that stamps no userkey on its "
             f"responses produces events EventBridge cannot attribute. "
             f"See DESIGN_PHASE3.md §3.3.")
 

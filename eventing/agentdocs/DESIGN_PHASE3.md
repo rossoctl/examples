@@ -2,7 +2,7 @@
 
 Status: draft (revision 1) — **partly implemented.** §9's steps 1-4 are in the tree:
 T1 (`shared/tenancy.py`), T2 (`TopicSet` threaded through both services), T3 (`Caller`,
-the registry, `ce_userkey`), T4 (`SIGNED_ATTRS` += `userkey`, `depth`), T13 (`AgentSpec`)
+the registry, `ce_userkey`), T4 (`SIGNED_ATTRS` += `userkey`, `depth`, `agent`), T13 (`AgentSpec`)
 and T22 (the Secret-vs-ConfigMap test). **T5 is also in** — per-user stores
 (`store_registry.py`), the global `correlationid → userkey` index (`owner_index.py`), and
 the `Minter` uniqueness check that replaces the startup seeding loop (§2.6).
@@ -340,7 +340,7 @@ deployment worse than an unsigned one because an operator believes it is atteste
 response is written into and which ntfy topic it is announced on, so an unsigned,
 mutable `userkey` would let anything with write access to a topic file an event into
 another user's history. See §8.3 on the canonicalisation break that adding it causes,
-and why it has to land with `depth` in one change rather than two.
+and why it has to land with `depth` and `agent` in one change rather than three.
 
 **The trap.** It is tempting to salt the session derivation —
 `uuid5(NAMESPACE, userkey + "/" + corr)` — so two tenants can never collide in
@@ -400,8 +400,10 @@ The brief's shape, with `{userid}` replaced by `{userkey}` for the reasons in §
 unchanged. The two topics this table adds have no Phase 2 predecessor to stay compatible
 with, so they are derived from the prefix instead: `{prefix}-events` and `{prefix}-dead`.
 
-`{prefix}` defaults to the namespace (`kev1`), configurable as `EB_TOPIC_PREFIX`,
-exactly as Phase 1 §5 prefixes the shared-broker topics today. It is validated as
+`{prefix}` defaults to `kev1`, configurable as `EB_TOPIC_PREFIX`. It is not derived
+from the namespace: a literal default keeps the names identical to Phase 1's shipped
+`kev1-` topics regardless of the namespace the chart lands in, and it matches
+§8.1's row. It is validated as
 `[a-zA-Z0-9-]{1,32}`: it is the one component of these names `_slug` never sees, and `.`
 or `_` in it reproduces precisely the JMX metric collision §3.1's naming rules below warn
 about. Longest realistic
@@ -571,10 +573,14 @@ Three things this buys that are worth naming:
   the ownership check on transcript writes possible at all (§6.3).
 
 `ER_USERKEY` is the new required variable in multi-tenant mode, and the runner
-**refuses to start without it** when `REQUEST_TOPIC` does not equal the bridge's
-single-tenant default. A runner that stamps no `userkey` on its responses produces
-events EventBridge cannot file, and a silent default here would route one user's
-output into another user's store.
+**refuses to start without it** when `REQUEST_TOPIC` is a per-user topic
+(`{prefix}-{userkey}-requests`, §3.1) whose embedded userkey it does not name. A
+runner that stamps no userkey on its responses produces events EventBridge cannot
+file, and a silent default here would route one user's output into another user's
+store. The refusal deliberately does not key on "REQUEST_TOPIC is not the
+single-tenant default": single-tenant deployments rename the default freely (the
+shipped Phase 1 configmap sets `kev1-requests`), and a renamed default is not a
+tenancy signal.
 
 ### 3.4 KEDA: one ScaledObject per user
 
@@ -1948,8 +1954,8 @@ whose depth is `>= EB_TRIGGER_MAX_DEPTH` (default **3**) and records a
 `trigger.dropped` with reason `depth-exceeded`.
 
 `depth` joins `signing.SIGNED_ATTRS`, and it must: an unsigned counter can be reset to
-zero in flight, which turns the whole control off. See §8.3 — this is the second
-canonicalisation-breaking change in Phase 3 and it has to land together with `userkey`.
+zero in flight, which turns the whole control off. See §8.3 — it is one of the three
+canonicalisation-breaking attributes of Phase 3, and they land in one change.
 
 **2. Responses are not trigger-eligible by default.** `EB_TRIGGER_ON_RESPONSES=false`.
 Agent chaining — "when the triager finishes, run the fixer" — is a legitimate and
@@ -2040,7 +2046,7 @@ upgrades and changes nothing behaves exactly as it did in Phase 2.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ER_USERKEY` | empty | Which tenant this runner serves (§3.3). Stamped on every response as `ce_userkey`. Required once `REQUEST_TOPIC` is not the default. |
+| `ER_USERKEY` | empty | Which tenant this runner serves (§3.3). Stamped on every response as `ce_userkey`. Required once `REQUEST_TOPIC` is a per-user topic that names a different userkey. |
 | `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2). |
 | `ER_AGENT_NAME` | `default` | Fallback agent when neither the trigger nor the registry names one. |
 | `ER_SKILL_SOURCES` | empty | Allowed source prefixes. **Empty means no fetching at all** (§5.4 gate 1). |
@@ -2093,7 +2099,7 @@ The dependency order is real — several steps are unsafe before the one above t
 3. **The registry and `Caller`** (§2.4, §2.5), still in `single` mode. `ce_userkey` is
    stamped on events but nothing routes on it — the Phase 2 §4.4 "audit before enforce"
    pattern, applied to tenancy.
-4. **`SIGNED_ATTRS` += `userkey`, `depth`** (§8.3). One change, both services.
+4. **`SIGNED_ATTRS` += `userkey`, `depth`, `agent`** (§8.3). One change, both services.
 5. **Per-user stores** (§6.1) and **owner-scoped reads** (§6.2), behind
    `EB_TENANCY_MODE=multi`. Now `multi` is usable by one real tenant.
 6. **Transcript auth** (§6.3). Must come before any second tenant exists: §6's opening
@@ -2163,7 +2169,7 @@ In the spirit of Phase 2 §3, the things a demo of this must not claim:
 | **T1** | `shared/tenancy.py`: `userkey`, `_canonicalise`, `_slug`, `TopicSet`, `ntfy_topic`. Tests: collision cases, the GitHub case-folding agreement with `ghauth.is_allowed`, topic/DNS/ntfy legality over a corpus of adversarial identifiers. | — |
 | **T2** | Thread `TopicSet` through `kafka_out`, `kafka_in`, `RequestsMirror`, `GroupMirror`, `eventrunner/consume`. `single` mode only; zero behaviour change. | T1 |
 | **T3** | `Caller`, the registry loader, `auth.resolve` returning `userkey`; `ce.EXT_USERKEY`; stamp it on requests. | T1 |
-| **T4** | `SIGNED_ATTRS` += `userkey`, `depth`, in one change, both services. | T3, T13 |
+| **T4** | `SIGNED_ATTRS` += `userkey`, `depth`, `agent`, in one change, both services. | T3, T13 |
 | **T5** | `StoreRegistry` + per-user store files + the global `correlationid → userkey` index + lazy `Minter` seeding (§2.6). | T3 |
 | **T6** | `Consumer.ensure_subscribed` with the blocking assignment wait, `auto_offset_reset=earliest`, and submit-path ordering. Test the race explicitly: publish before subscribe must fail the test. | T2 |
 | **T7** | Owner-scoped reads: `404` not `403`, the group-list filter, and the single-tenant bypass. | T5 |

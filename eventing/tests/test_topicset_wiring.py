@@ -175,7 +175,7 @@ def test_the_emitter_omits_the_userkey_in_single_mode():
     assert ce.EXT_USERKEY not in _sent_event(em._prod).attrs
 
 
-def test_the_runner_refuses_a_non_default_request_topic_without_a_userkey(monkeypatch):
+def test_the_runner_refuses_a_per_user_topic_without_a_userkey(monkeypatch):
     """§3.3: a runner that stamps no userkey produces events EventBridge cannot
     attribute, and a silent default would route one user's output into another's store."""
     from eventrunner import config as ercfg
@@ -183,6 +183,27 @@ def test_the_runner_refuses_a_non_default_request_topic_without_a_userkey(monkey
     monkeypatch.delenv("ER_USERKEY", raising=False)
     with pytest.raises(SystemExit, match="ER_USERKEY is required"):
         ercfg.load()
+
+
+def test_the_runner_refuses_a_per_user_topic_with_a_mismatched_userkey(monkeypatch):
+    """The topic embeds one tenant; ER_USERKEY names another. Attributing the
+    responses to the named one would file them in the wrong store — refuse."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", f"kev1-{UK}-requests")
+    monkeypatch.setenv("ER_USERKEY", "gh-alice-00000000")
+    with pytest.raises(SystemExit, match="ER_USERKEY is required"):
+        ercfg.load()
+
+
+def test_the_runner_accepts_a_renamed_single_tenant_topic_without_a_userkey(monkeypatch):
+    """`k8s/base/configmap.yaml` ships `REQUEST_TOPIC: kev1-requests` for the
+    Phase 1 single-tenant deployment, with no ER_USERKEY. Renaming the default is
+    not a tenancy signal; the old refusal — any non-default topic — refused to boot
+    exactly this deployment."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", "kev1-requests")
+    monkeypatch.delenv("ER_USERKEY", raising=False)
+    assert ercfg.load().userkey == ""
 
 
 def test_the_runner_accepts_a_per_user_topic_with_a_userkey(monkeypatch):

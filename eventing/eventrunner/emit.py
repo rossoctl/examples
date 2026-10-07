@@ -13,7 +13,8 @@ class Emitter:
     """§11: signs **terminal events only**, and what that does and does not prove.
 
     `emit()` runs for every `stdout` frame an agent produces, and the pure-Python
-    Ed25519 here costs ~150-200 ms per signature, so signing every frame would add
+    Ed25519 here costs 190-230 ms per signature (measured: 222 ms sign / 227 ms
+    verify, IMPLEMENTATION_REPORT1 §9), so signing every frame would add
     minutes to a chatty run. Terminal events are one per run, where the cost is
     invisible against an agent that already took seconds.
 
