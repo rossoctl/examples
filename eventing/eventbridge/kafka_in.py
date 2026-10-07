@@ -132,7 +132,7 @@ class Consumer(threading.Thread):
                             verified = False
                             print(f"[kafka_in] verification error: {e!r}")
                     d = ce.envelope_dict(evt)
-                    if ok and not verified and self._keyset is not None:
+                    if ok and not verified:
                         # Audit mode: the event is stored unchanged, and this line plus
                         # the counter are the only trace that enforcement would have
                         # refused it. §4.4's two-flag rollout ("a keyset alone verifies

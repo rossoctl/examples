@@ -402,9 +402,13 @@ def test_expect_kid_pins_the_signer_to_one_identity(tmp_path):
 # ---- response_decision: enabled? verified? enforced? -------------------------
 
 def test_response_decision_accepts_everything_when_no_keyset_is_configured():
-    """Today's behaviour, which must survive untouched as the default."""
+    """Today's behaviour, which must survive untouched as the default. `verified=True`
+    here is the same reading as the unsigned non-terminal passthrough: nothing being
+    configured to check is an acceptance by policy, not a failed check — so
+    `accept and not verified` stays the audit-mode population with no caller-side
+    keyset guard."""
     ok, why, verified = S.response_decision(_event(), None, require=True)
-    assert ok and "not enabled" in why
+    assert ok and verified and "not enabled" in why
 
 
 def test_response_decision_accepts_a_verified_response(tmp_path):

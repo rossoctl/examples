@@ -464,11 +464,12 @@ def response_decision(event, ks, *, require: bool,
     be read by a human in a log line, not parsed. A caller that wants to count what
     *would* have been rejected reads this flag.
 
-    So, with a keyset configured, `accept and not verified` is exactly the audit-mode
-    population: the events enforcement would have refused. The unsigned non-terminal
-    passthrough reports `verified=True` because it is accepted by policy rather than in
-    spite of a failure, and `ks is None` reports False but is excluded by the caller's
-    own "is a keyset configured" check.
+    So `accept and not verified` is exactly the audit-mode population: the events
+    enforcement would have refused. The unsigned non-terminal passthrough reports
+    `verified=True` because it is accepted by policy rather than in spite of a failure,
+    and so does `ks is None` — with no keyset configured there is nothing to enforce and
+    nothing that could fail it, so that population is empty and no caller-side "is a
+    keyset configured" guard is needed to keep it empty.
 
     `bridge_kid` pins group lifecycle events to EventBridge's own key. It is only
     applied when set, so a single-key deployment — where `KeySet.select(None)` returns
@@ -486,7 +487,11 @@ def response_decision(event, ks, *, require: bool,
     masquerade as the result.
     """
     if ks is None:
-        return True, "verification not enabled", False
+        # `verified=True`: verification not being configured is an acceptance by
+        # policy (the same reading as the unsigned non-terminal passthrough), not a
+        # failed check — so `accept and not verified` stays the audit-mode
+        # population with no caller-side keyset guard to forget.
+        return True, "verification not enabled", True
     expect = bridge_kid if (bridge_kid and ce.is_group_event(event)) else None
     ok, why = verify_with_keyset(event, ks, expect_kid=expect)
     if ok:
