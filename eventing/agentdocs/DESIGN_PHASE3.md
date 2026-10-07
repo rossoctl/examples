@@ -402,13 +402,12 @@ with, so they are derived from the prefix instead: `{prefix}-events` and `{prefi
 
 `{prefix}` defaults to `kev1`, configurable as `EB_TOPIC_PREFIX`. It is not derived
 from the namespace: a literal default keeps the names identical to Phase 1's shipped
-`kev1-` topics regardless of the namespace the chart lands in, and it matches
-§8.1's row. It is validated as
-`[a-zA-Z0-9-]{1,32}`: it is the one component of these names `_slug` never sees, and `.`
-or `_` in it reproduces precisely the JMX metric collision §3.1's naming rules below warn
-about. Longest realistic
-name: `kev1-` + 2 + 1 + 24 + 1 + 8 + `-responses` = 51 characters, against Kafka's
-249 — comfortable, and worth having checked rather than assumed.
+`kev1-` topics regardless of the namespace the chart lands in, and it matches §8.1's
+row. It is validated as `[a-zA-Z0-9-]{1,32}`: it is the one component of these names
+`_slug` never sees, and `.` or `_` in it reproduces precisely the JMX metric collision
+§3.1's naming rules below warn about. Longest realistic name: `kev1-` + 2 + 1 + 24 +
+1 + 8 + `-responses` = 51 characters, against Kafka's 249 — comfortable, and worth
+having checked rather than assumed.
 
 Two naming rules that bite if ignored:
 
@@ -573,14 +572,27 @@ Three things this buys that are worth naming:
   the ownership check on transcript writes possible at all (§6.3).
 
 `ER_USERKEY` is the new required variable in multi-tenant mode, and the runner
-**refuses to start without it** when `REQUEST_TOPIC` is a per-user topic
-(`{prefix}-{userkey}-requests`, §3.1) whose embedded userkey it does not name. A
-runner that stamps no userkey on its responses produces events EventBridge cannot
-file, and a silent default here would route one user's output into another user's
-store. The refusal deliberately does not key on "REQUEST_TOPIC is not the
-single-tenant default": single-tenant deployments rename the default freely (the
-shipped Phase 1 configmap sets `kev1-requests`), and a renamed default is not a
-tenancy signal.
+**refuses to start** on a mismatch between it and `REQUEST_TOPIC`, in either
+direction: a per-user topic (`{prefix}-{userkey}-requests`, §3.1) the key does not
+name, and — the inverse, which is just as wrong — a key set while `REQUEST_TOPIC`
+is not that user's per-user topic. In the inverse direction the runner would
+consume the shared topic while stamping `ce_userkey` on every response (the stamp
+keys on the key's presence, not on tenancy mode), filing every response as one
+tenant's. A runner that stamps no userkey on its responses produces events
+EventBridge cannot file, and a silent default here would route one user's output
+into another user's store. The key must also have `userkey()`'s shape
+(`is_valid_userkey`): a typo'd key names nobody, and StoreRegistry counts every
+stamped response `unattributed`.
+
+The match itself anchors on the key the runner holds rather than decomposing the
+topic name: `{prefix}-{userkey}-{suffix}` is an ambiguous grammar — dashes are
+legal in both the prefix and the slug inside `userkey` — so any split picks an
+arbitrary answer (`prod-eu-gh-alice-…-requests` splits shortest-first and embeds
+the wrong key), and a split-based check would refuse a correctly-configured
+deployment with a dashed prefix. `topic_names_userkey` needs no split. The refusal
+deliberately does not key on "REQUEST_TOPIC is not the single-tenant default"
+either: single-tenant deployments rename the default freely (the shipped Phase 1
+configmap sets `kev1-requests`), and a renamed default is not a tenancy signal.
 
 ### 3.4 KEDA: one ScaledObject per user
 
@@ -2046,7 +2058,7 @@ upgrades and changes nothing behaves exactly as it did in Phase 2.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ER_USERKEY` | empty | Which tenant this runner serves (§3.3). Stamped on every response as `ce_userkey`. Required once `REQUEST_TOPIC` is a per-user topic that names a different userkey. |
+| `ER_USERKEY` | empty | Which tenant this runner serves (§3.3). Stamped on every response as `ce_userkey`. Must name the tenant `REQUEST_TOPIC` serves, in either direction: a per-user topic without the matching key refuses, and a key without its per-user topic refuses too. |
 | `ER_AGENT_DIR` | `/etc/rossoctl/agents` | Where baked `AgentSpec`s live (§5.2). |
 | `ER_AGENT_NAME` | `default` | Fallback agent when neither the trigger nor the registry names one. |
 | `ER_SKILL_SOURCES` | empty | Allowed source prefixes. **Empty means no fetching at all** (§5.4 gate 1). |

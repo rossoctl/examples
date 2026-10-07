@@ -111,11 +111,10 @@ class Cfg:
 
     # §3.3 — which tenant this runner serves. Stamped on every response as
     # `ce_userkey`, which is what lets EventBridge file the response in the right
-    # store. Empty is single-tenant mode (the default, = Phase 2). Required once
-    # REQUEST_TOPIC is a per-user topic naming a different userkey: a runner that
-    # stamps no userkey produces events EventBridge cannot attribute, and a silent
-    # default here would route one user's output into another user's store. `load`
-    # enforces that, loudly.
+    # store. Empty is single-tenant mode (the default, = Phase 2). Must agree with
+    # REQUEST_TOPIC in either direction — a per-user topic without this key, or
+    # this key without its per-user topic, is a deployment rendered wrong — and
+    # must have userkey()'s shape. `load` enforces all three, loudly.
     userkey: str = ""
 
     # §5.2 — where baked AgentSpecs live. A directory in the image, not a mount:
@@ -176,31 +175,61 @@ def load() -> Cfg:
 
     # §3.3, §5.1-§5.2.
     cfg.userkey    = (e("ER_USERKEY") or "").strip()
+    if cfg.userkey and not tenancy.is_valid_userkey(cfg.userkey):
+        # A key without tenancy.userkey()'s shape (<iss>-<slug>-<8 hex>) could not
+        # have come from the registry, so it names nobody: EventBridge's
+        # StoreRegistry would count every stamped response `unattributed`. Catching
+        # the typo at boot is cheaper than finding it on /healthz after the work is
+        # lost — and the topic-name checks below cannot catch it, because a topic
+        # rendered from the same typo'd key anchors against it consistently.
+        raise SystemExit(
+            f"ER_USERKEY {cfg.userkey!r} does not have the shape tenancy.userkey() "
+            f"produces (<iss>-<slug>-<8 hex>, e.g. gh-alice-a1b2c3d4). Check the "
+            f"user registry entry it was rendered from. See DESIGN_PHASE3.md §3.3.")
     cfg.agent_dir  = e("ER_AGENT_DIR",  cfg.agent_dir)
     cfg.agent_name = e("ER_AGENT_NAME", cfg.agent_name)
-    # A per-user runner is pointed at a per-user topic, so a REQUEST_TOPIC that embeds
-    # a userkey with no matching ER_USERKEY means the deployment was rendered wrong.
+    # A per-user runner is pointed at a per-user topic. Both directions of a mismatch
+    # between the two are a deployment rendered wrong, and both refuse to start:
+    #   - a per-user REQUEST_TOPIC the configured ER_USERKEY does not name — the
+    #     responses would be stamped for a tenant whose topic this is not;
+    #   - ER_USERKEY set while REQUEST_TOPIC is NOT a per-user topic — the runner
+    #     would consume the shared topic and stamp `ce_userkey` on every response
+    #     (`emit.py` keys the stamp on userkey presence, not on tenancy mode), filing
+    #     every response into one tenant's store.
     # Refusing to start is the only safe direction: the alternative is responses
-    # EventBridge files into the `shared` store or drops, which looks exactly like an
-    # agent that never answered. The check keys on the per-user topic shape
-    # (`{prefix}-{userkey}-requests`, §3.1) rather than on "not the default name":
-    # single-tenant deployments rename the default freely (the shipped K8s configmap
-    # sets `kev1-requests`) and renaming alone is not a tenancy signal.
-    embedded = tenancy.userkey_in_topic(cfg.request_topic)
-    if embedded is not None and embedded != cfg.userkey:
+    # EventBridge files into the `shared` store or another user's, which looks
+    # exactly like an agent that never answered. `topic_names_userkey` anchors on the
+    # key in hand rather than splitting the name — the `{prefix}-{userkey}-{suffix}`
+    # grammar is ambiguous when both prefix and slug contain dashes, so a split-based
+    # check false-positives on legal dashed prefixes (`prod-eu-…`). The per-user
+    # question itself is shape-only, and every valid split still means "per-user".
+    # A single-tenant deployment renaming the default (the shipped K8s configmap sets
+    # `kev1-requests`) is not a tenancy signal and still boots.
+    if tenancy.userkey_in_topic(cfg.request_topic) is not None \
+            and not tenancy.topic_names_userkey(cfg.request_topic, cfg.userkey):
         # Two distinct faults share this exit, and the message names which one: an
         # unset ER_USERKEY (the runner stamps nothing) and one that disagrees with the
         # topic (the runner stamps the wrong tenant). Saying "is required" for the
-        # second would be wrong — it was supplied, it just names someone else.
+        # second would be wrong — it was supplied, it just names someone else. The
+        # topic rides in the message because it carries the key it should name: the
+        # anchoring check does not extract one, and the exit line stays diagnosable
+        # without reading the chart.
         problem = ("ER_USERKEY is required when REQUEST_TOPIC is a per-user topic"
                    if not cfg.userkey else
-                   f"ER_USERKEY must match the userkey embedded in REQUEST_TOPIC, "
+                   f"ER_USERKEY must match the tenant REQUEST_TOPIC serves, "
                    f"but names {cfg.userkey!r}")
         raise SystemExit(
-            f"{problem} (got {cfg.request_topic!r}, whose embedded userkey is "
-            f"{embedded!r}). A runner that stamps no userkey — or the wrong one — on "
-            f"its responses produces events EventBridge cannot attribute, or files "
-            f"them in another user's store. "
+            f"{problem} (got {cfg.request_topic!r}). A runner that stamps no "
+            f"userkey — or the wrong one — on its responses produces events "
+            f"EventBridge cannot attribute, or files them in another user's store. "
+            f"See DESIGN_PHASE3.md §3.3.")
+    if cfg.userkey and not tenancy.topic_names_userkey(cfg.request_topic, cfg.userkey):
+        raise SystemExit(
+            f"ER_USERKEY is set but REQUEST_TOPIC {cfg.request_topic!r} is not this "
+            f"userkey's per-user topic. A runner configured this way consumes the "
+            f"shared topic while stamping every response as {cfg.userkey!r} — in "
+            f"multi-tenant mode that files other users' responses into one user's "
+            f"store. Set REQUEST_TOPIC to the per-user topic, or clear ER_USERKEY. "
             f"See DESIGN_PHASE3.md §3.3.")
 
     base = e("TMPDIR", "/tmp").rstrip("/")

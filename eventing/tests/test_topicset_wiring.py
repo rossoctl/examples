@@ -204,6 +204,52 @@ def test_the_runner_refuses_a_per_user_topic_with_a_mismatched_userkey(monkeypat
     assert UK in msg                    # what the topic says it should be
 
 
+def test_the_runner_accepts_a_per_user_topic_with_a_dashed_prefix(monkeypatch):
+    """`{prefix}-{userkey}-{suffix}` is an ambiguous grammar — dashes are legal in
+    both the prefix and the slug — so a split-based check false-positives on a
+    correctly-configured deployment with a dashed prefix: the non-greedy split of
+    `prod-eu-gh-alice-ed66acf0-requests` yields `eu-gh-alice-ed66acf0`. The guard
+    anchors on the key in hand instead (`topic_names_userkey`), which needs no
+    split and cannot be wrong about the one key it is asked about."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", "prod-eu-gh-alice-ed66acf0-requests")
+    monkeypatch.setenv("ER_USERKEY", "gh-alice-ed66acf0")
+    assert ercfg.load().userkey == "gh-alice-ed66acf0"
+
+
+def test_the_runner_accepts_a_per_user_topic_with_a_multi_dash_slug(monkeypatch):
+    """The greedy fix's failure mode: slugs themselves contain dashes
+    (`oi-alice-example-com-9e8f7a6b` is userkey()'s own docstring example), so a
+    longest-prefix split is wrong the other way. The anchored check is indifferent."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", "kev1-oi-alice-ex-ample-com-1f806a21-requests")
+    monkeypatch.setenv("ER_USERKEY", "oi-alice-ex-ample-com-1f806a21")
+    assert ercfg.load().userkey == "oi-alice-ex-ample-com-1f806a21"
+
+
+def test_the_runner_refuses_a_userkey_on_a_shared_topic(monkeypatch):
+    """The inverse misconfiguration: ER_USERKEY set while REQUEST_TOPIC is not that
+    user's per-user topic. `emit.py` keys its stamp on userkey presence, not tenancy
+    mode, so this runner would consume the shared topic and file every response as
+    one tenant's — the harm §3.3 names, from the other direction."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", "kev1-requests")
+    monkeypatch.setenv("ER_USERKEY", UK)
+    with pytest.raises(SystemExit, match="is not this userkey's per-user topic"):
+        ercfg.load()
+
+
+def test_the_runner_refuses_an_invalid_userkey_shape(monkeypatch):
+    """A key without tenancy.userkey()'s shape names nobody — StoreRegistry counts
+    every stamped response `unattributed` — and a topic rendered from the same
+    typo'd key anchors against it consistently, so only a shape check catches it."""
+    from eventrunner import config as ercfg
+    monkeypatch.setenv("REQUEST_TOPIC", f"kev1-{UK}-requests")
+    monkeypatch.setenv("ER_USERKEY", "gh-alice-typo")
+    with pytest.raises(SystemExit, match="does not have the shape"):
+        ercfg.load()
+
+
 def test_the_runner_accepts_a_renamed_single_tenant_topic_without_a_userkey(monkeypatch):
     """`k8s/base/configmap.yaml` ships `REQUEST_TOPIC: kev1-requests` for the
     Phase 1 single-tenant deployment, with no ER_USERKEY. Renaming the default is

@@ -165,12 +165,16 @@ def userkey(issuer: str, userid: str) -> str:
 _USERKEY_CORE = rf"[a-z]{{2}}-[a-z0-9][a-z0-9-]{{0,{_SLUG_MAX - 1}}}-[0-9a-f]{{{_DIGEST_HEX}}}"
 USERKEY_RE = re.compile(rf"^{_USERKEY_CORE}$")
 
+# TopicSet's four per-user suffixes (§3.1). One tuple because two recognisers need
+# the same list: the shape regex below and `topic_names_userkey`'s anchored check.
+_SUFFIXES = ("requests", "responses", "events", "dead")
+
 # A per-user topic name, `{prefix}-{userkey}-{suffix}` (§3.1): the prefix agrees with
 # EventBridge's `EB_TOPIC_PREFIX` validation and the suffixes are `TopicSet`'s four.
-# `userkey_in_topic` uses it to recognise — not interpret — a per-user topic on the
-# runner side, where the topic arrives as a bare string with no TopicSet in hand.
+# Used to recognise — not interpret — a per-user topic: see `userkey_in_topic` for why
+# the split it captures cannot be trusted for identity.
 PER_USER_TOPIC_RE = re.compile(
-    rf"^[a-zA-Z0-9-]{{1,32}}?-(?P<userkey>{_USERKEY_CORE})-(?:requests|responses|events|dead)$")
+    rf"^[a-zA-Z0-9-]{{1,32}}?-(?P<userkey>{_USERKEY_CORE})-(?:{'|'.join(_SUFFIXES)})$")
 
 
 def is_valid_userkey(value: str | None) -> bool:
@@ -200,18 +204,22 @@ def is_valid_userkey(value: str | None) -> bool:
 
 
 def userkey_in_topic(topic: str | None) -> str | None:
-    """The userkey a per-user topic name embeds, or `None` if it embeds none.
+    """Whether a topic name is per-user, and a key it *might* embed — ambiguous by
+    construction, so only the yes/no answer is reliable.
 
-    A per-user topic is `{prefix}-{userkey}-{suffix}` (§3.1) and `userkey` itself
-    contains `-`, so the name cannot be split — the key has to be found by shape.
-    This is the inverse of `TopicSet.requests(userkey)` and lives next to
-    `is_valid_userkey` for the same reason: this module is the only place an
-    identity becomes a name, so recognising one inside a name belongs here too.
+    A per-user topic is `{prefix}-{userkey}-{suffix}` (§3.1) and both `prefix`
+    (`[a-zA-Z0-9-]{1,32}`, dashes allowed) and the slug inside `userkey` can contain
+    `-`, so the grammar has several valid splits and any one regex quantifier picks
+    one: non-greedy prefers the shortest prefix (`prod-eu-gh-alice-ed66acf0-requests`
+    yields `eu-gh-alice-ed66acf0`), greedy prefers the longest (`kev1-oi-alice-ex-
+    ample-com-1f806a21-requests` yields the slug-only tail). Both are ordinary
+    configurations. **The returned key must therefore never be compared for
+    identity** — use `topic_names_userkey`, which anchors on the key the caller
+    already holds and needs no split at all. This function's value is its yes/no
+    answer: every valid split still means "per-user".
 
     `None` is the answer for every single-tenant topic — including renamed defaults
-    like `kev1-requests` — because a renamed default is not a tenancy signal. The
-    caller decides what a per-user name without a matching key means; here it is
-    just "this is not a per-user topic".
+    like `kev1-requests` — because a renamed default is not a tenancy signal.
 
     False negatives are safe here: the runner's refusal is a deployment guard, not
     the last line of defense — EventBridge's `StoreRegistry.for_event` is what
@@ -221,6 +229,24 @@ def userkey_in_topic(topic: str | None) -> str | None:
         return None
     m = PER_USER_TOPIC_RE.fullmatch(topic)
     return m.group("userkey") if m else None
+
+
+def topic_names_userkey(topic: str | None, userkey: str | None) -> bool:
+    """Whether `topic` is this tenant's per-user topic. No split, so no ambiguity.
+
+    The check the runner actually needs — "does this topic belong to a tenant other
+    than the one I am configured as?" — does not require decomposing the name, only
+    matching the key already in hand against the name's end: `{prefix}-{userkey}-
+    {suffix}` anchored on `-{userkey}-{suffix}` can be satisfied by exactly one
+    key, whatever dashes the prefix and slug contain.
+
+    The caller supplies the key, so a typo'd or forged `ER_USERKEY` answers `False`
+    against a real per-user topic — which is the safe direction for a boot-time
+    guard: refuse, loudly, and let the operator read the error.
+    """
+    if not topic or not userkey:
+        return False
+    return any(topic.endswith(f"-{userkey}-{s}") for s in _SUFFIXES)
 
 
 def ntfy_topic(prefix: str, userkey: str, secret: bytes) -> str:
