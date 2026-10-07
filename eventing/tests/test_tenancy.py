@@ -238,6 +238,92 @@ def test_single_mode_inbox_and_dead_are_derived_from_the_prefix():
     assert ts.dead() == "kev1-dead"
 
 
+# ---- userkey_in_topic ------------------------------------------------------
+
+def test_userkey_in_topic_recognises_topicset_names_as_per_user():
+    """`TopicSet`'s four per-user names are recognised as per-user. The captured key
+    is deliberately not asserted — see the ambiguity test below."""
+    uk = T.userkey("github", "Mrsabath")
+    ts = T.TopicSet("kev1", tenancy=T.MULTI)
+    for method in (ts.requests, ts.responses, ts.events, ts.dead):
+        assert T.userkey_in_topic(method(uk)) is not None
+        assert T.topic_names_userkey(method(uk), uk)
+
+
+@pytest.mark.parametrize("suffix", ["requests", "responses", "events", "dead"])
+def test_userkey_in_topic_recognises_each_suffix(suffix):
+    """Recognition only — the split's captured key is not asserted, per the
+    ambiguity test below."""
+    uk = T.userkey("oidc", "alice@example.com")
+    assert T.userkey_in_topic(f"kev1-{uk}-{suffix}") is not None
+    assert T.topic_names_userkey(f"kev1-{uk}-{suffix}", uk)
+
+
+def test_userkey_in_topic_returns_none_for_single_tenant_names():
+    """A renamed default is not a tenancy signal — this is the case the runner's
+    old refusal got wrong, refusing to boot `k8s/base/configmap.yaml`'s
+    `REQUEST_TOPIC: kev1-requests`."""
+    assert T.userkey_in_topic("requests") is None
+    assert T.userkey_in_topic("kev1-requests") is None
+    assert T.userkey_in_topic("kev1-kev1-requests") is None
+    assert T.userkey_in_topic("") is None
+    assert T.userkey_in_topic(None) is None
+
+
+def test_userkey_in_topic_requires_a_per_user_suffix():
+    uk = T.userkey("github", "Mrsabath")
+    assert T.userkey_in_topic(f"kev1-{uk}") is None
+    assert T.userkey_in_topic(f"kev1-{uk}-other") is None
+
+
+def test_userkey_in_topic_rejects_names_that_are_not_userkey_products():
+    """The embedded component must have the `userkey()` shape — anything else is a
+    coincidence of dashes, not a tenant."""
+    assert T.userkey_in_topic("kev1-shared-requests") is None
+    assert T.userkey_in_topic("kev1-GH-MRSABATH-4C1D9E07-requests") is None
+    assert T.userkey_in_topic("kev1-gh-alice-notahex-requests") is None
+
+
+def test_userkey_in_topic_split_is_ambiguous_and_only_the_yes_no_is_reliable():
+    """Dashes are legal in both the prefix and the slug, so the split a regex
+    quantifier picks is arbitrary: `prod-eu-…` (dashed prefix) splits shortest-first
+    and embeds the wrong key, and a multi-dash slug splits the other way under a
+    greedy quantifier. Both answers are still 'per-user', which is the only claim
+    the caller may rely on — identity goes through `topic_names_userkey`."""
+    # Non-greedy picks the shortest prefix, so the captured key is wrong here…
+    assert T.userkey_in_topic("prod-eu-gh-alice-ed66acf0-requests") == "eu-gh-alice-ed66acf0"
+    # …yet the same name, anchored on the real key, is recognised as that tenant's.
+    assert T.topic_names_userkey("prod-eu-gh-alice-ed66acf0-requests", "gh-alice-ed66acf0")
+    assert not T.topic_names_userkey("prod-eu-gh-alice-ed66acf0-requests", "eu-gh-xxxxxxx")
+
+
+def test_topic_names_userkey_matches_by_suffix_anchor():
+    uk = T.userkey("github", "Mrsabath")
+    for suffix in ("requests", "responses", "events", "dead"):
+        assert T.topic_names_userkey(f"kev1-{uk}-{suffix}", uk)
+        assert not T.topic_names_userkey(f"kev1-{uk}-{suffix}", "gh-someone-00000000")
+
+
+def test_topic_names_userkey_rejects_shared_and_missing_names():
+    uk = T.userkey("github", "Mrsabath")
+    assert not T.topic_names_userkey("kev1-requests", uk)     # single-tenant rename
+    assert not T.topic_names_userkey("requests", uk)
+    assert not T.topic_names_userkey("", uk)
+    assert not T.topic_names_userkey(None, uk)
+    assert not T.topic_names_userkey("kev1-requests", "")     # no key in hand
+    assert not T.topic_names_userkey("kev1-requests", None)
+    assert not T.topic_names_userkey(None, None)
+
+
+def test_topic_names_userkey_needs_the_suffix_boundary():
+    """`-{userkey}-requests` is the anchor; a name merely ending in the key, or
+    embedding it without the suffix, must not match."""
+    uk = T.userkey("github", "Mrsabath")
+    assert not T.topic_names_userkey(f"kev1-{uk}", uk)
+    assert not T.topic_names_userkey(f"kev1-{uk}-other", uk)
+    assert not T.topic_names_userkey(f"prefix-{uk}-requests-extra", uk)
+
+
 # ---- ntfy_topic ------------------------------------------------------------
 
 SECRET = b"a-test-ntfy-topic-secret"

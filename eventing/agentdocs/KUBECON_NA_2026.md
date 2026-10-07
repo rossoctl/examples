@@ -774,5 +774,5 @@ been read rather than run. Confirm it before spending anything on either CNI opt
 | Date | Change |
 |---|---|
 | 2026-10-05 | Created. Captures the accepted abstract, status against it as of `main`, the SPIRE decision, the W1–W6 plan, and the 30-minute slide/demo shape |
-| 2026-10-06 | M1 and M2 filed as #895 and #896; §5 gains a tracking table |
 | 2026-10-05 | Added §5, the M1-M4 MVP cut (~2 days) with sequencing, explicit cuts and the talk it supports. Corrected §4/W3: Kind's default CNI is kindnetd and does not enforce NetworkPolicy, so the `NetworkPolicy` MVP was unbuildable as written — three options tabulated, M3 recommends substituting the #888 asymmetry for the egress beat. §7's risk table and §8's observations updated; the 30-minute shape renumbered §5→§6, risks §6→§7, observations §7→§8 |
+| 2026-10-06 | M1 and M2 filed as #895 and #896; §5 gains a tracking table |

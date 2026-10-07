@@ -675,7 +675,7 @@ Run the unit tests any time you want to reprove the DESIGN §4.5 contract withou
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# → ....................  20 passed in ~0.6s
+# → ..........................................................  58 passed in 7.27s
 ```
 
 The four tests in `tests/test_router.py` cover FIFO ordering per correlationid, cross-correlation parallelism, the concurrency cap, and slot re-arm after drain.

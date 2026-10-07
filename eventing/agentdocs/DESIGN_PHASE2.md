@@ -386,6 +386,7 @@ unaffected until an operator opts in:
 | `ER_SIGNING_KEY_PATH` | empty | Seed EventRunner signs terminal responses with. |
 | `ER_SIGNING_KID` | empty | Names this runner's key. Needed once more than one runner is approved. |
 | `ER_REQUIRE_SIGNATURE` | `false` | Refuse unsigned or badly-signed requests. |
+| `ER_VERIFY_KEY_PATH` | empty | Single public key requests are verified against. Empty falls back to the public half of `ER_SIGNING_KEY_PATH`'s seed. |
 | `ER_VERIFY_KEYSET_PATH` | empty | Approved-key set for requests. Empty falls back to `ER_VERIFY_KEY_PATH`'s single key. |
 
 Seed paths name **Secret** mounts and are env-only, never `config.toml`. Keyset

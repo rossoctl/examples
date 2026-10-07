@@ -89,7 +89,7 @@ def _scalar_mult(p: tuple[int, int], e: int) -> tuple[int, int]:
     strictly true: with `EB_SIGNING_KEY_PATH` set, EventBridge signs on the HTTP
     request path, so a caller who can time `POST /v0/agents` observes something
     correlated with the scalar. What still makes it acceptable is that the signal is
-    buried under a Kafka round trip and a ~150 ms pure-Python operation whose variance
+    buried under a Kafka round trip and a ~200 ms pure-Python operation whose variance
     dwarfs the leak, the seed never leaves the pod, and signing remains opt-in. It is
     a real if impractical weakness rather than a non-issue — do not promote this to a
     trust boundary that assumes constant time.
@@ -478,7 +478,8 @@ def response_decision(event, ks, *, require: bool,
     **Unsigned non-terminal frames are accepted, and that is not a loophole being
     left open — it is the signing policy on the other side.** `emit()` signs terminal
     events only, because it runs for every `stdout` frame and a signature costs
-    ~150-200 ms; verifying all-or-nothing would rewrite every streamed frame of every
+    ~190-230 ms (measured: 222 ms sign / 227 ms verify, IMPLEMENTATION_REPORT1 §9);
+    verifying all-or-nothing would rewrite every streamed frame of every
     genuine run to `phase=error`. So an event that carries no signature AND is not
     terminal is passed through, while an unsigned **terminal** event is still refused —
     that is the one the transcript presents as the answer, and refusing it is the whole
