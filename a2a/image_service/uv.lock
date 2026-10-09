@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "a2a-sdk"
-version = "1.1.1"
+version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "culsans", marker = "python_full_version < '3.13'" },
@@ -22,9 +22,9 @@ dependencies = [
     { name = "protobuf" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/1d/5214ce0a1932a986002b2d22f457d260376e7f91134f978f58a214b5ad88/a2a_sdk-1.1.1.tar.gz", hash = "sha256:1662462d1d0efef697917c59ffdef543248a1ffa9ea0f7c8403d087f4958e28b", size = 377552, upload-time = "2026-07-16T13:29:58.911Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/35/55b15fd6467ed4e40860badd5fd2040dd4612f879c98a9c196f5ee4349c9/a2a_sdk-1.2.2.tar.gz", hash = "sha256:09be001a90fae9634d54041471feca1014201ec22f7107f0883309a2b4027a15", size = 431163, upload-time = "2026-10-05T09:50:44.569Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/91/ab2ba19dea0771f7d5503f80e2f756f8f7195acd0e91d55e8ea893bf626f/a2a_sdk-1.1.1-py3-none-any.whl", hash = "sha256:60608eb77d62ae962795cf0bcb06f24be8470b4bf97adbc4ed32f170e9f40c3e", size = 244090, upload-time = "2026-07-16T13:29:57.387Z" },
+    { url = "https://files.pythonhosted.org/packages/25/ce/1f00b7f1cd5691b78045e495d7c46af810557414695cf68b1847e2b5e25d/a2a_sdk-1.2.2-py3-none-any.whl", hash = "sha256:f2aa9692f3e3034f58ebff501e091d43affa416878c734fd63016ae0b8ea8c66", size = 275972, upload-time = "2026-10-05T09:50:42.784Z" },
 ]
 
 [package.optional-dependencies]
@@ -892,7 +892,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.1.1,<2" },
+    { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.2.2,<2" },
     { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "cryptography", specifier = ">=49.0.0,<50" },
     { name = "langchain-classic", specifier = ">=1.0.8" },
