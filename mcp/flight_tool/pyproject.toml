@@ -11,6 +11,6 @@ dependencies = [
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
     "fastmcp>=3.4.4",           # Indirect; prevents CVE-2026-32871 (critical), CVE-2026-27124 (high)
     "protobuf>=7.35.1",         # Indirect; prevents CVE-2026-0994
-    "cryptography>=49.0.0,<50", # Indirect; prevents CVE-2026-26007
+    "cryptography>=49.0.0,<51", # Indirect; prevents CVE-2026-26007
     "pyjwt>=2.13.0",            # Indirect; prevents CVE-2026-32597
 ]
