@@ -9,6 +9,6 @@ dependencies = [
     "requests>=2.34.2",
     "authlib>=1.7.2",   # Indirect; prevents CVE-2026-27962
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66471, CVE-2026-21441, CVE-2026-44431
-    "cryptography>=49.0.0,<50", # Indirect; prevents CVE-2026-26007
+    "cryptography>=49.0.0,<51", # Indirect; prevents CVE-2026-26007
     "pyjwt>=2.13.0",            # Indirect; prevents CVE-2026-32597
 ]
