@@ -42,7 +42,7 @@ hand, and — see §5 — it is what makes the SPIRE upgrade path expensive.
 | **0** | The wire contract: CloudEvents, correlation and session identity, per-conversation ordering | Built; laptop only |
 | **1** | Kubernetes and KEDA: scale-to-zero, agent groups | Built; measured on two clusters |
 | **2** | Identity on the event path: who submitted, which agent answered | Wired; **13 control claims found false in review** |
-| **3** | Per-user isolation, declarative agents, event triggers | **Partial** — rollout steps 1–4 plus T5; the rest is design |
+| **3** | Per-user isolation, declarative agents, event triggers | **Partial** — rollout steps 1–4, plus T5, T13 and T22; the rest is design |
 | **4** | Enrollment and human-in-the-loop approval | **Design only**; its core mechanism is measured |
 
 Phases are deltas, not replacements. Where a later phase supersedes an earlier
@@ -87,7 +87,7 @@ terminal event makes consumer lag a correct queue gauge *and* makes it
 structurally impossible for KEDA to scale away a pod mid-stream. The fix for
 "never miss an event" is also the fix for "don't kill a running agent". Observed
 by accident: a real run sat in 429 retry backoff for 300 s and replicas stayed
-at or above 1 for all 300 s (`IMPLEMENTATION_REPORT1.md` §7).
+at or above 1 for all 300 s (`KUBECON_NA_2026.md` §2.3).
 
 Three gaps, each measured on the broker rather than assumed
 (`DESIGN_PHASE1.md` §16):
@@ -173,8 +173,10 @@ restated claim **by running it**. Thirteen did not hold. The worst:
 The diagnosis generalises beyond this component: *each claim was written from the
 change that introduced it, and stayed true only for the configuration that
 change was exercised in.* And the detail that should worry anyone relying on a
-test suite as evidence: **all thirteen coexisted with a passing suite of ~900
-tests**, because the tests exercised the configuration each claim was true in.
+test suite as evidence: **all thirteen coexisted with a passing suite** — 904
+tests collected at the time of the Phase 2 review, 896 passing on CI
+(`KUBECON_NA_2026.md` §2) — because the tests exercised the configuration each
+claim was true in.
 
 That produced **five questions to ask of any control claim before it ships**
 (§8.5) — the most reusable output of the whole project:
@@ -225,7 +227,8 @@ counter is a signed attribute, since an unsigned counter can be reset in flight.
 
 The whole phase rests on one question, and it was settled by running it: **can a
 tool call be paused mid-run in headless `claude -p` until an external system
-answers?** Measured against `claude 2.1.270`: a `PreToolUse` hook fires in `-p`
+answers?** Measured against `claude 2.1.270` — not reconfirmed on the currently
+pinned `2.1.278` — a `PreToolUse` hook fires in `-p`
 mode, **blocks for 75 s without the tool running**, honours its configured
 timeout, and on `deny` the tool never executes while the reason reaches the agent.
 
@@ -261,17 +264,22 @@ cryptographic control.
 
 Two statuses deserve emphasis because they are easy to misread.
 
-**Phase 3's `multi` mode routes but does not yet authorize.** It gives each
-tenant its own store and topics; it does **not** check that a reader is the
+**Phase 3's `multi` mode is for developing against, not running.** It gives each
+tenant its own store and topics, but until T6 neither consumer subscribes to the
+per-user topics, so **no response is ever consumed** — transcript pages stay
+empty and group counters never advance (`IMPLEMENTATION_REPORT3.md` §5, which is
+explicit that this is a more useful warning than "not yet isolated", because the
+latter implies a working-but-unisolated mode). Reads are also not owner-scoped: a
+read routes to the owning tenant's store, but nothing checks the caller is that
 owner. The flag is deliberately environment-only — a committed config file that
-could flip it is "a way to get per-user isolation half-enabled by accident". It
-should not be enabled or demoed until owner-scoped reads and transcript
-authentication land.
+could flip it is "a way to get per-user isolation half-enabled by accident".
 
 **Signing is implemented but unproven in deployment.** The cryptography is
 checked against the RFC's own test vectors and the canonicalisation is
-injective, but the signed path has never run end to end on a cluster, and the
-open issues in §5 mean enforcement is currently advisory.
+injective, but the signed path has never run end to end on a cluster, and
+enforcement is currently advisory — `EB_REQUIRE_RESPONSE_SIGNATURE` defaults to
+`false`, and [#885](https://github.com/rossoctl/examples/issues/885) means a
+rejected response can still end a batch even when it is `true`.
 
 ## 5. The KubeCon NA 2026 commitment
 
@@ -320,8 +328,10 @@ that has a tempting wrong answer. The §8.5 five questions are portable to any
 service making control claims.
 
 **Where the risk actually is.** Not in any single open bug, but in the pattern
-Phase 2 §8.4 names: **the documentation is more rigorous than the code**, and
-~900 passing tests did not catch the two worst findings. Half-configured states
+Phase 2 §8.4 names: **the documentation is more rigorous than the code**, and a
+suite of 904 tests did not catch
+[#885](https://github.com/rossoctl/examples/issues/885) or
+[#888](https://github.com/rossoctl/examples/issues/888). Half-configured states
 are where this system fails, and the two services fail in *opposite* directions.
 Phases 3 and 4 add controls of exactly the same shape, so the five questions need
 to be a gate on new work rather than a retrospective on old work.
@@ -335,8 +345,9 @@ to be a gate on new work rather than a retrospective on old work.
    resistant — do not promote this to a trust boundary that assumes it is"
    warning that now has production callers, and the rule is what makes SPIRE
    expensive.
-3. **Phase 3 `multi` mode** — do not enable or demo it until owner-scoped reads
-   and transcript authentication land.
+3. **Phase 3 `multi` mode** — there is nothing to demo yet. T6 has to land before
+   any response is consumed at all, and owner-scoped reads and transcript
+   authentication before a second tenant exists.
 
 ---
 
@@ -349,4 +360,5 @@ to be a gate on new work rather than a retrospective on old work.
 | Running it, in any of four environments | [`agentdocs/README_PHASE1.md`](../agentdocs/README_PHASE1.md) |
 | Identity, and the thirteen findings | [`agentdocs/DESIGN_PHASE2.md`](../agentdocs/DESIGN_PHASE2.md) §8 |
 | Writing a claim about a control, in any phase | [`agentdocs/DESIGN_PHASE2.md`](../agentdocs/DESIGN_PHASE2.md) §8.5 |
+| What the tenancy work has actually built, and what `multi` does not do | [`agentdocs/IMPLEMENTATION_REPORT3.md`](../agentdocs/IMPLEMENTATION_REPORT3.md) §5 |
 | The talk: status, plan, slide shape | [`agentdocs/KUBECON_NA_2026.md`](../agentdocs/KUBECON_NA_2026.md) |
