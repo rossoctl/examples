@@ -445,16 +445,16 @@ wheels = [
 
 [[package]]
 name = "fast-flights"
-version = "2.2"
+version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "primp" },
     { name = "protobuf" },
     { name = "selectolax" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2c/11/207d9a9300466e6f2f95cc7fcb150ffa35416aa8de15850aa35cf39c5e30/fast_flights-2.2.tar.gz", hash = "sha256:d496630793357e16a03f1bba94f52d81504cd8772350918d91ac8b2589b20c7d", size = 52692, upload-time = "2025-03-08T23:41:40.687Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/40/a8355032a1bd40bae23a8b94cd8019fb0567df7ca32c19b37a7c256912a0/fast_flights-3.1.0.tar.gz", hash = "sha256:3a0e279312b0dedbe7a83af2c10c7c984a792a93050ff69c33d996f703dfd706", size = 22154, upload-time = "2026-08-18T07:31:26.099Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0c/ba/06b2d76e22cd0f1d467830bd05e191ef80db07c5016d7cc6b1adb4097145/fast_flights-2.2-py3-none-any.whl", hash = "sha256:ad8393f29c57797b4d7f03df1c8c66771302ece3ab268a13be0b3ae7a93291ad", size = 52610, upload-time = "2025-03-08T23:41:39.353Z" },
+    { url = "https://files.pythonhosted.org/packages/20/cb/60419fedc21fb664baf753912b4645deb38ee7653e11fbde3728ed84464c/fast_flights-3.1.0-py3-none-any.whl", hash = "sha256:90c629646a591ff04a9f164ba651432f595232c3537cda5275db25c07283429a", size = 22966, upload-time = "2026-08-18T07:31:24.862Z" },
 ]
 
 [[package]]
