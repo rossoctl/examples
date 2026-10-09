@@ -143,6 +143,17 @@ class GroupService:
         corr = event.get("correlationid")
         if not groupid or not corr:
             return
+        # #885 — a rejected envelope is evidence, not a fact. Before `add_group_member`,
+        # because a membership row is itself a state change: it makes an unknown
+        # correlation a member of this batch and moves `members_seen`, which `progress`
+        # and `completion_reason` both read.
+        #
+        # Without this, a forged terminal wins `mark_member_finished`'s `finished_utc IS
+        # NULL` race and the genuine answer that follows is swallowed by the duplicate
+        # guard below — so the forgery does not merely add a lie, it destroys the truth.
+        if ce.is_rejected(event):
+            _log(f"rejected event for {groupid}/{corr} not counted")
+            return
         # §6.1: the store is chosen by the event's own `userkey`, which is signed (§2.6)
         # and therefore not rewritable in flight. Routing by the event rather than by any
         # ambient state is what keeps one tenant's batch progress out of another's store.
@@ -176,6 +187,13 @@ class GroupService:
         """
         groupid = event.get("groupid")
         if not groupid:
+            return
+        # #885 — before `create_group` as well as before `complete_group`. A forged
+        # `started` is not harmless noise: `expected` is the denominator every progress
+        # figure divides by, and a forged `completed` ends a batch early and fires a
+        # "finished" notification for work that never ran.
+        if ce.is_rejected(event):
+            _log(f"rejected group event for {groupid} not applied")
             return
         data = event.get("data") or {}
         store = self._store_for(event.get(ce.EXT_USERKEY))
