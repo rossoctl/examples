@@ -1,16 +1,29 @@
+# Code owners for rossoctl/examples.
+#
+# Owners here are DERIVED from the project's source of truth for maintainership:
+#   https://github.com/rossoctl/rossoctl/blob/main/MAINTAINERS.md
+#
+# CODEOWNERS cannot reference that file, or any file: GitHub accepts only user and team
+# handles, and it is read only from this repository's root, .github/ or docs/ -- there is no
+# inheritance from rossoctl/rossoctl to lean on. So these names are a copy, and they have to
+# be updated when MAINTAINERS.md changes.
+#
+# A rule naming a user or team that does not exist, or that lacks write access here, is
+# silently ignored -- the matched paths end up with no owner and no warning. If you edit this
+# file, confirm every handle still has access.
+
 # Default owners for everything
 * @rossoctl/maintainers
 
-# CI and platform tooling
-.github/ @rossoctl/platform
-Makefile @rossoctl/platform
+# CI and platform tooling. Gloire owns org-wide CI and repo governance; Ed owns the
+# rossoctl-cli and has written most of the Makefile.
+.github/ @rubambiza
+Makefile @esnible
 
-# A2A agents
-a2a/ @rossoctl/agents
+# A2A agents and MCP tools
+a2a/ @pdettori
+mcp/ @pdettori
 
-# MCP tools
-mcp/ @rossoctl/agents
-
-# Documentation
-docs/ @rossoctl/maintainers
+# Documentation. There is no docs/ directory in this repo -- the previous rule for it
+# matched nothing. Each example documents itself in its own README.
 *.md @rossoctl/maintainers
