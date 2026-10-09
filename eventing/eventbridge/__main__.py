@@ -204,10 +204,16 @@ def main() -> int:
     # commits offsets and so never re-reads, which meant a restarted pod (with an
     # emptyDir /data) served 404 for every earlier group even though its notifications
     # had already gone out. One-shot, never publishes, never notifies.
+    # #885 — the same keyset and kid the live consumer verifies with. The mirror uses
+    # them on `group.completed` only, because a forged completion refused above is
+    # otherwise applied unconditionally on the next restart. The half-configured case
+    # (a keyset with no kid) is already refused at startup above, so there is nothing
+    # to re-guard here.
     group_mirror = GroupMirror(cfg.kafka_bootstrap, cfg.response_topic, groups,
                                topics=topics,
                                userkeys=users.userkeys if topics.multi else (),
-                               owners=owners if topics.multi else None)
+                               owners=owners if topics.multi else None,
+                               keyset=ks, bridge_kid=cfg.signing_kid or None)
     group_mirror.start()
 
     h = Handlers(cfg, store, producer, minter, groups=groups,

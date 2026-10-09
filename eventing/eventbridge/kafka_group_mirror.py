@@ -35,7 +35,7 @@ import threading
 
 from kafka import KafkaConsumer, TopicPartition
 
-from shared import ce, tenancy
+from shared import ce, signing, tenancy
 
 
 def _log(msg: str) -> None:
@@ -49,7 +49,7 @@ class GroupMirror(threading.Thread):
                  metadata_tries: int = 20, max_empty_polls: int = 15,
                  topics: tenancy.TopicSet | None = None,
                  userkeys: tuple[str, ...] = (),
-                 owners=None) -> None:
+                 owners=None, keyset=None, bridge_kid: str | None = None) -> None:
         super().__init__(daemon=True, name="kafka-group-mirror")
         self._bootstrap_servers = bootstrap
         # §3.2: unlike the live consumers this one is one-shot at startup, so it "can
@@ -68,6 +68,24 @@ class GroupMirror(threading.Thread):
         # to, both for settling and for back-filling a missing `userkey`. `None` keeps
         # the single-tenant behaviour, where there is one store and nothing to resolve.
         self._owners = owners
+        # #885 — the mirror is a SECOND, independent acting path. A forged
+        # `group.completed` refused by the live consumer sits on the topic and was then
+        # applied unconditionally on the very next restart, so a guard in `kafka_in`
+        # alone closed the hole only until the pod bounced.
+        #
+        # **It verifies group.completed and nothing else, and only when both a keyset
+        # and a bridge kid are configured.** Verifying everything would be catastrophic
+        # rather than strict: the mirror exists to replay history that predates signing
+        # entirely, it runs on every start, and the `test`/`kind` overlays keep /data on
+        # an `emptyDir` — so refusing unsigned records would lose every group's state on
+        # every restart, which is the exact failure this module was written to prevent.
+        #
+        # `group.completed` is the only mirror path that can settle a batch:
+        # `on_member_event(replay=True)` returns before `maybe_complete`, and a forged
+        # `group.started` creates an empty group row, which is noise rather than a
+        # settled batch reporting work that never ran.
+        self._keyset = keyset
+        self._bridge_kid = bridge_kid
         # Partitions are assigned by hand and nothing is ever committed: the whole
         # point is to re-read from the beginning on every start, which the live
         # committing consumer cannot do. See run() for why there is no group id.
@@ -77,6 +95,9 @@ class GroupMirror(threading.Thread):
         self.total_to_read = 0
         self.rebuilt_groups = 0
         self.rebuilt_members = 0
+        # #885 — group.completed events skipped on replay because they could not be
+        # attributed to the bridge's own key.
+        self.refused = 0
         self.settled = 0
 
     def stop(self) -> None:
@@ -220,6 +241,22 @@ class GroupMirror(threading.Thread):
                 d[ce.EXT_USERKEY] = owner
         try:
             if ce.is_group_event(evt):
+                # #885 — only the completion, and only when configured. See __init__.
+                if (self._keyset is not None and self._bridge_kid
+                        and d.get("type") == ce.TYPE_GROUP_COMPLETED):
+                    try:
+                        ok, why, _ = signing.response_decision(
+                            evt, self._keyset, require=True,
+                            bridge_kid=self._bridge_kid)
+                    except Exception as e:  # noqa: BLE001
+                        # Fail closed: a verifier that cannot answer is not evidence
+                        # that this completion is genuine. One skipped group is a 404
+                        # on its page; a wrongly-settled one reports work that never ran.
+                        ok, why = False, f"verifier raised: {e!r}"
+                    if not ok:
+                        self.refused += 1
+                        _log(f"refusing replayed completion for {gid}: {why}")
+                        return None
                 self._groups.on_group_event(d, replay=True)
                 self.rebuilt_groups += 1
             else:

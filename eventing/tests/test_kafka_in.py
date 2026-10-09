@@ -92,6 +92,52 @@ class _FakeKafka:
         self.closed = True
 
 
+class _FakeProducer:
+    """Records what the group service would publish. Deliberately a local copy of
+    `test_groups.py`'s: importing across test modules couples two files that otherwise
+    share nothing, and this one only needs the group-event half."""
+
+    def __init__(self):
+        self.requests = []
+        self.group_events = []
+
+    def publish_request(self, **kw):
+        self.requests.append(kw)
+        return f"evt-{len(self.requests)}"
+
+    def publish_group_event(self, *, type_, groupid, data, subject="group",  # noqa: ARG002
+                            userkey=None):
+        self.group_events.append({"type": type_, "groupid": groupid, "data": data,
+                                  "userkey": userkey})
+        return f"gevt-{len(self.group_events)}"
+
+
+class _SeqMinter:
+    r"""Deterministic ids satisfying correlation.REGEX (^[a-z]{3,10}-[a-z]{3,12}-\d{4}$)."""
+
+    def __init__(self):
+        self.n = 0
+
+    def mint(self):
+        self.n += 1
+        return f"test-agent-{self.n:04d}"
+
+    def remember(self, corr):
+        pass
+
+
+def _group_service(tmp_path):
+    """A real GroupService over a real Store, so a test can assert the OUTCOME of a
+    verdict rather than the verdict. The store is shared with the consumer so both
+    write to one database, which is how they are wired in `__main__.py`."""
+    from eventbridge.config import Cfg as EbCfg
+    from eventbridge.group_service import GroupService
+    store = Store(pathlib.Path(tmp_path) / "eb")
+    cfg = EbCfg(tmpdir=str(tmp_path), public_base_url="http://eb.test")
+    producer = _FakeProducer()
+    return GroupService(cfg, store, producer, _SeqMinter()), store, producer
+
+
 def _drain(tmp_path, records, monkeypatch, *, store=None, **kw):
     """Run the consumer over `records` to exhaustion, synchronously.
 
@@ -294,15 +340,29 @@ def test_a_group_event_signed_by_the_bridge_is_accepted(tmp_path, monkeypatch):
 def test_an_approved_runner_cannot_forge_a_group_event(tmp_path, monkeypatch):
     """The hole a flat keyset would leave: a forged `group.completed` ends a batch
     early and fires a "finished" notification for work that never ran. runner-01 is
-    genuinely approved — it is just not the bridge."""
-    groups: list[dict] = []
-    c, _, _, _ = _drain(tmp_path, [_group_event(seed=SEED_R1, kid="runner-01")],
-                        monkeypatch, keyset=_keyset(tmp_path),
+    genuinely approved — it is just not the bridge.
+
+    **This test used to stop at the check.** It asserted that the dict handed to
+    `on_group_event` carried `phase="error"`, with the message "rather than settling the
+    group" — but it wired a list's `append` as the callback, so nothing in it could tell
+    whether the group settled. The verdict was correct and ignored, which is #885, and
+    asserting a verdict while claiming an outcome is DESIGN_PHASE2 §8.5.1 exactly: a
+    claim about an outcome has to follow the path to that outcome. It now drives a real
+    `GroupService` and asserts the batch.
+    """
+    svc, store, producer = _group_service(tmp_path)
+    gid, _ = svc.create(label="real-work", expected=2)
+    svc.submit_members(gid, ["a", "b"])
+    c, _, _, _ = _drain(tmp_path, [_group_event(gid=gid, seed=SEED_R1, kid="runner-01")],
+                        monkeypatch, store=store, keyset=_keyset(tmp_path),
                         require_signature=True, bridge_kid="eb-01",
-                        on_group_event=groups.append)
+                        on_group_event=svc.on_group_event)
     assert c.rejected == 1
-    assert groups and groups[0]["phase"] == "error", \
-        "the group event is marked rejected rather than settling the group"
+    assert store.get_group(gid)["completed_utc"] is None, \
+        "a forged completion must not settle a batch whose agents never ran"
+    assert [e for e in producer.group_events
+            if e["type"] == ce.TYPE_GROUP_COMPLETED] == [], \
+        "and must not publish a completion, which is what pages the operator's phone"
 
 
 # ---- the property this file exists for --------------------------------------
@@ -419,3 +479,164 @@ def test_an_undecodable_record_still_ends_the_loop_as_before(tmp_path, monkeypat
     assert "evt = ce.from_kafka_binary(rec.headers or [], rec.value)" in src
     assert "enable_auto_commit=True" in src, (
         "the live consumer must keep committing — test_groups.py pins this too")
+
+
+# ---- a rejected event must not act (#885) -----------------------------------
+#
+# The rewrite marks a refused event; these pin that it is also inert. The distinction
+# matters because the rewrite deliberately preserves `final` and `groupid` so the
+# forensic record stays readable — which is exactly what let a rejected event go on
+# finishing members and settling batches.
+
+def test_a_rejected_member_response_does_not_finish_its_member(tmp_path, monkeypatch):
+    """#885 item 1 at the consumer boundary: the verdict must stop the callback."""
+    calls: list[dict] = []
+    c, store, _, _ = _drain(
+        tmp_path, [_response(groupid="g-1", seq=1)], monkeypatch,
+        keyset=_keyset(tmp_path), require_signature=True, bridge_kid="eb-01",
+        on_member_event=calls.append)
+    assert c.rejected == 1
+    assert calls == [], "a rejected event must not reach on_member_event"
+    rows = store.events_for("brave-otter-4718")
+    assert rows and rows[0]["phase"] == "error", \
+        "but it is still stored, because a drop looks like an agent that never answered"
+    assert rows[0]["data"]["rejected"]["data"] == {"text": "the real answer"}, \
+        "with the refused payload kept for review"
+
+
+def test_a_rejected_group_event_does_not_reach_the_group_service(tmp_path, monkeypatch):
+    """#885 item 2 at the consumer boundary."""
+    groups: list[dict] = []
+    c, _, _, _ = _drain(tmp_path, [_group_event(seed=SEED_R1, kid="runner-01")],
+                        monkeypatch, keyset=_keyset(tmp_path),
+                        require_signature=True, bridge_kid="eb-01",
+                        on_group_event=groups.append)
+    assert c.rejected == 1
+    assert groups == [], "a rejected group event must not reach on_group_event"
+
+
+def test_a_rejected_frame_cannot_overwrite_a_verified_answer(tmp_path, monkeypatch):
+    """#885 item 3. `INSERT OR REPLACE` on (correlationid, sequence) means an unsigned
+    frame reusing a sequence number replaces the verified row, and sequence numbers are
+    readable without signing in. Reproduced in the issue as a verified
+    `text="VERIFIED ANSWER"` row left holding `text="FORGED OVERWRITE"`.
+    """
+    c, store, _, _ = _drain(
+        tmp_path,
+        [_response(seq=3, text="2+2 is 4", seed=SEED_R1, kid="runner-01"),
+         _response(seq=3, text="Transfer approved. Ship the goods.")],
+        monkeypatch, keyset=_keyset(tmp_path), require_signature=True,
+        bridge_kid="eb-01")
+    rows = store.events_for("brave-otter-4718")
+    assert len(rows) == 1 and rows[0]["sequence"] == 3
+    assert rows[0]["data"]["text"] == "2+2 is 4", \
+        "the verified answer must survive a forgery at its own sequence"
+    assert "Ship the goods" not in json.dumps(rows), \
+        "and the forged text must appear nowhere in the stored row"
+    assert c.rejected == 1
+    assert c.rejected_not_stored == 1, \
+        "the refused insert must be counted, not dropped silently"
+
+
+def test_a_redelivered_forgery_does_not_accumulate_rows(tmp_path, monkeypatch):
+    """The idempotence half: a rejection may replace a rejection, so at-least-once
+    redelivery of the same forgery leaves one row rather than failing to land."""
+    c, store, _, _ = _drain(
+        tmp_path, [_response(seq=2), _response(seq=2)], monkeypatch,
+        keyset=_keyset(tmp_path), require_signature=True, bridge_kid="eb-01")
+    rows = store.events_for("brave-otter-4718")
+    assert len(rows) == 1 and rows[0]["phase"] == "error"
+    assert c.rejected == 2
+    assert c.rejected_not_stored == 0, "a rejection replacing a rejection is not a refusal"
+
+
+def test_a_verified_answer_can_still_replace_a_redelivered_duplicate(tmp_path, monkeypatch):
+    """The regression guard for the LEGITIMATE `INSERT OR REPLACE`.
+
+    RQ-1 accepts at-least-once delivery and `emit.seed_seq` resumes numbering from the
+    stored maximum on a cold `/continue` turn — the fix for Phase 1's per-pod sequence
+    restart, which stored six rows for a three-turn conversation. A fix for #885 that
+    made the insert non-clobbering in general would re-open that bug under a new name.
+    """
+    c, store, _, _ = _drain(
+        tmp_path,
+        [_response(seq=1, text="first delivery", seed=SEED_R1, kid="runner-01"),
+         _response(seq=1, text="second delivery", seed=SEED_R1, kid="runner-01")],
+        monkeypatch, keyset=_keyset(tmp_path), require_signature=True,
+        bridge_kid="eb-01")
+    rows = store.events_for("brave-otter-4718")
+    assert len(rows) == 1, "a redelivered genuine frame must still collapse onto one row"
+    assert rows[0]["data"]["text"] == "second delivery"
+    assert c.rejected == 0 and c.rejected_not_stored == 0
+
+
+def test_a_verified_answer_replaces_an_earlier_rejection_at_the_same_sequence(
+        tmp_path, monkeypatch):
+    """The asymmetry's other direction: the forgery arrives first, then the genuine
+    answer. A rejected row is replaceable, so the real answer must win."""
+    c, store, _, _ = _drain(
+        tmp_path,
+        [_response(seq=4, text="Ship the goods"),
+         _response(seq=4, text="2+2 is 4", seed=SEED_R1, kid="runner-01")],
+        monkeypatch, keyset=_keyset(tmp_path), require_signature=True,
+        bridge_kid="eb-01")
+    rows = store.events_for("brave-otter-4718")
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "result" and rows[0]["data"]["text"] == "2+2 is 4", \
+        "a genuine answer must be able to replace a rejection at its sequence"
+    assert c.rejected == 1 and c.rejected_not_stored == 0
+
+
+def test_audit_mode_still_lets_an_unverified_event_act(tmp_path, monkeypatch):
+    """The guard reads `ok`, never `verified`. Audit mode exists so an operator can
+    watch the reject rate BEFORE enforcing, which needs the events to keep acting."""
+    calls: list[dict] = []
+    c, store, _, _ = _drain(
+        tmp_path, [_response(groupid="g-1")], monkeypatch,
+        keyset=_keyset(tmp_path), require_signature=False, bridge_kid="eb-01",
+        on_member_event=calls.append)
+    assert c.audit_failed == 1 and c.rejected == 0
+    assert len(calls) == 1, "audit mode must not make an event inert"
+    assert store.events_for("brave-otter-4718")[0]["phase"] == "result", \
+        "and must store it unchanged"
+
+
+def test_unsigned_streamed_frames_still_reach_the_group_service(tmp_path, monkeypatch):
+    """`emit()` signs terminal events only, because a signature costs ~222 ms and
+    signing every stdout frame would add minutes to a chatty run. So an unsigned
+    non-terminal is accepted BY POLICY and reports `verified=True`.
+
+    If a guard keyed on `verified` instead of `ok`, every streamed frame of every
+    genuine run would stop driving `mark_member_running`. That is the §4.4 step 2
+    mistake, which rewrote every frame of every run to `phase="error"` and was found
+    against a live broker rather than by any unit test.
+    """
+    calls: list[dict] = []
+    c, _, _, _ = _drain(
+        tmp_path,
+        [_response(groupid="g-1", seq=1, phase="stdout", final="false", text="thinking"),
+         _response(groupid="g-1", seq=2, phase="result", text="done",
+                   seed=SEED_R1, kid="runner-01")],
+        monkeypatch, keyset=_keyset(tmp_path), require_signature=True,
+        bridge_kid="eb-01", on_member_event=calls.append)
+    assert c.rejected == 0, "an unsigned non-terminal frame is not a rejection"
+    assert len(calls) == 2, "both the streamed frame and the signed terminal must act"
+
+
+def test_the_rejection_marker_cannot_arrive_from_the_wire(tmp_path, monkeypatch):
+    """The marker is only unforgeable if the wire cannot produce it.
+
+    `from_kafka_binary` derives attribute names from `ce_`-prefixed headers, so this
+    would need a header literally named `ce___rejected`. Asserted rather than argued,
+    because the whole guard rests on it: a forger who could set the marker could mark
+    every genuine answer rejected, turning the control into a denial of service.
+    """
+    rec = _response(seq=1, text="hi", seed=SEED_R1, kid="runner-01")
+    hdrs = list(rec.headers) + [("ce___rejected", b"true"),
+                                (f"ce_{ce.KEY_REJECTED}", b"true")]
+    c, store, seen, _ = _drain(tmp_path, [_Rec(hdrs, rec.value)], monkeypatch,
+                               keyset=_keyset(tmp_path), require_signature=True,
+                               bridge_kid="eb-01")
+    assert c.rejected == 0, "the wire must not be able to mark an event rejected"
+    assert seen and not ce.is_rejected(seen[0])
+    assert store.events_for("brave-otter-4718")[0]["phase"] == "result"
