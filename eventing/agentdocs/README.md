@@ -26,6 +26,11 @@ and what is *not* verified.
 
 ## Reading order
 
+- **Deciding whether to fund, demo or depend on this?**
+  [`../docs/EXECUTIVE_SUMMARY.md`](../docs/EXECUTIVE_SUMMARY.md) — what each phase
+  decided, what is built as opposed to designed, and the KubeCon commitment with its
+  gaps. It cites these documents rather than restating them, and it is the only one
+  written for a reader who will not open the code.
 - **Running it?** [`README_PHASE1.md`](README_PHASE1.md), or the [Phase 1
   section](../README.md#phase-1--kubernetes-and-keda) of the component README for
   the short version.

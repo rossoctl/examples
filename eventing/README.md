@@ -1083,14 +1083,22 @@ multi-replica EventBridge, and TLS to Kafka.
 
 The long-form designs, build reports and full runbooks live in
 **[`agentdocs/`](agentdocs/)**, which has [its own index](agentdocs/README.md). They
-are the authoritative references this file summarizes:
+are the authoritative references this file summarizes. The one-page summary of all of
+them, for a reader who will not open the code, is in
+[`docs/`](docs/EXECUTIVE_SUMMARY.md):
 
 | | |
 |---|---|
+| [`docs/EXECUTIVE_SUMMARY.md`](docs/EXECUTIVE_SUMMARY.md) | **start here if you are not going to open the code** — what each phase decided, what is built as opposed to designed, and the KubeCon commitment with its gaps |
 | [`agentdocs/DESIGN_PHASE0.md`](agentdocs/DESIGN_PHASE0.md) | the wire contract, the `uuid5` session scheme, and the §4.5 per-correlation ordering guarantee |
 | [`agentdocs/DESIGN_PHASE1.md`](agentdocs/DESIGN_PHASE1.md) | the KEDA scaling model, the §16 gaps, and §3.2 on the local Kind target |
+| [`agentdocs/DESIGN_PHASE2.md`](agentdocs/DESIGN_PHASE2.md) | identity on the event path — and §8, the thirteen control claims a docs review disproved, with §8.5's five questions |
+| [`agentdocs/DESIGN_PHASE3.md`](agentdocs/DESIGN_PHASE3.md) | per-user isolation, `AgentSpec`, and event triggers — partly implemented, `EB_TENANCY_MODE` still defaults to `single` |
+| [`agentdocs/DESIGN_PHASE4.md`](agentdocs/DESIGN_PHASE4.md) | enrollment and human-in-the-loop approval — design only, with §2 the measured mechanism the rest rests on |
 | [`agentdocs/IMPLEMENTATION_REPORT0.md`](agentdocs/IMPLEMENTATION_REPORT0.md) | what Phase 0 built, and the follow-ups it left |
 | [`agentdocs/IMPLEMENTATION_REPORT1.md`](agentdocs/IMPLEMENTATION_REPORT1.md) | what Phase 1 built, measured results on both clusters, 28 findings, and what is still blocked |
+| [`agentdocs/IMPLEMENTATION_REPORT3.md`](agentdocs/IMPLEMENTATION_REPORT3.md) | what Phase 3 has built so far, measured — and §5, which is explicit that `multi` does not work end to end |
+| [`agentdocs/KUBECON_NA_2026.md`](agentdocs/KUBECON_NA_2026.md) | the KubeCon NA talk: the abstract's five demo beats, their status, the SPIRE decision, and the MVP cut |
 | [`agentdocs/README_PHASE0.md`](agentdocs/README_PHASE0.md) | the laptop runbook in full detail |
 | [`agentdocs/README_PHASE1.md`](agentdocs/README_PHASE1.md) | the Phase 1 runbook in full detail — local, Docker, Kind, OpenShift |
 
