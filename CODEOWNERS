@@ -1,16 +1,35 @@
+# Code owners for rossoctl/examples.
+#
+# Owners here are DERIVED from the project's source of truth for maintainership:
+#   https://github.com/rossoctl/rossoctl/blob/main/MAINTAINERS.md
+#
+# CODEOWNERS cannot reference that file, or any file: GitHub accepts only user and team
+# handles, and it is read only from this repository's root, .github/ or docs/ -- there is no
+# inheritance from rossoctl/rossoctl to lean on. So these names are a copy, and they have to
+# be updated when MAINTAINERS.md changes.
+#
+# A rule naming a user or team that does not exist, or that lacks write access here, fails
+# nothing visibly -- the matched paths just end up with no owner. GitHub does report it, in
+# the CODEOWNERS file view and via the API. After editing, check that this prints []:
+#   gh api 'repos/rossoctl/examples/codeowners/errors?ref=<branch>' --jq .errors
+
 # Default owners for everything
 * @rossoctl/maintainers
 
-# CI and platform tooling
-.github/ @rossoctl/platform
-Makefile @rossoctl/platform
+# Every rule below also lists @rossoctl/maintainers, because CODEOWNERS is
+# last-match-wins: a path rule REPLACES the `*` default rather than adding to it. Naming
+# one person alone would mean workflow edits and the Dependabot Actions bumps auto-request
+# a single reviewer, with no backstop when they are away.
 
-# A2A agents
-a2a/ @rossoctl/agents
+# CI and platform tooling, owned per MAINTAINERS.md (org-wide CI & repo governance;
+# rossoctl-cli and the build).
+.github/ @rubambiza @rossoctl/maintainers
+Makefile @esnible @rossoctl/maintainers
 
-# MCP tools
-mcp/ @rossoctl/agents
+# A2A agents and MCP tools
+a2a/ @pdettori @rossoctl/maintainers
+mcp/ @pdettori @rossoctl/maintainers
 
-# Documentation
-docs/ @rossoctl/maintainers
+# Documentation. There is no docs/ directory in this repo -- the previous rule for it
+# matched nothing. Each example documents itself in its own README.
 *.md @rossoctl/maintainers
