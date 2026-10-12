@@ -475,6 +475,25 @@ deletes the original intent loses the more useful half.
 
 ### 8.1 Promises in §4.4 that the code does not keep
 
+**Status, 2026-10-09: the two #885 rows below are fixed; the table records what the code
+did when the review found it, per §8.7.** A rejected event is now inert as well as
+marked — it is stored and rendered, but it reaches neither `on_group_event`,
+`on_member_event` nor a verified row's sequence, and the group mirror verifies
+`group.completed` against the bridge's kid on replay. The single rule and the three
+places it is read are `ce.is_rejected`; the reason it keys on a top-level marker rather
+than on `phase="error"` is that genuine agent failures carry that phase, so the obvious
+guard would have broken every real failure instead of the forgeries.
+
+Two corrections to what this table claims, found by running it:
+
+* The `__rejected` marker **was** forgeable from the wire. A header named
+  `ce___rejected` strips to exactly that key, so until `from_kafka_binary` started
+  refusing `__`-prefixed names a forger could mark every *genuine* answer rejected —
+  inverting the control rather than bypassing it. Found by the test written to assert
+  the opposite, which is §8.5.4's question answered the wrong way at first.
+* #886 (the keyset-alone row) and #888 (the `EB_SIGNING_KID` row) were fixed earlier, in
+  #902 and #888's own change.
+
 | §4.4 says | The code does | Issue |
 |---|---|---|
 | "A keyset alone verifies **and logs**" | Verifies and returns a verdict. Nothing is logged or counted, so the observable reject rate the two-flag rollout depends on does not exist. | [#886](https://github.com/rossoctl/examples/issues/886) |

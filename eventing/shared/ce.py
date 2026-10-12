@@ -85,6 +85,31 @@ CE_HEADER_PREFIX = "ce_"
 CORE_ATTRS = {"specversion", "type", "source", "id", "time",
               "subject", "datacontenttype"}
 
+# #885 — set by the responses consumer on an envelope whose signature was REFUSED under
+# enforcement. Not a CloudEvent attribute and never on the wire: it is a local verdict,
+# travelling with the one thing every acting path already receives.
+#
+# **Why a top-level key and not `phase` or `data`.** Both alternatives are wrong in a way
+# that took reading the emit path to see:
+#
+#   * `phase == "error"` is a GENUINE value. `eventrunner/runner.py` emits
+#     `phase="error", final=True` whenever an agent fails, and
+#     `Store.mark_member_finished` maps that to status `failed`. A guard keyed on `phase`
+#     would stop every real agent failure from finishing its member, so the batch would
+#     hang to its deadline — silence, which §21.6 calls the worst outcome for a batch.
+#   * `data["signature_rejected"]` is attacker-chosen. `data` arrives off the wire intact,
+#     so a forger could set it and turn the guard into a denial of service against genuine
+#     traffic. That is DESIGN_PHASE2 §8.5.4 ("can an attacker choose the input the check
+#     reads?") answered the wrong way.
+#
+# **The `__` prefix is a convention; `from_kafka_binary` is what enforces it.** The
+# prefix alone is not enough and assuming it was is a mistake worth recording: a header
+# named `ce___rejected` strips to exactly this key, so the wire *could* set the marker
+# until the codec started refusing `__`-prefixed names. A forger able to set it could
+# mark every genuine answer rejected, which is a denial of service rather than a
+# bypass — the control inverted instead of removed. `test_kafka_in.py` pins the refusal.
+KEY_REJECTED = "__rejected"
+
 
 def is_group_event(event) -> bool:
     """True for a group lifecycle event.
@@ -94,6 +119,24 @@ def is_group_event(event) -> bool:
     (correlationid, sequence) primary key.
     """
     return event.get("type") in GROUP_TYPES
+
+
+def is_rejected(event) -> bool:
+    """True for an envelope the responses consumer refused. #885.
+
+    The one predicate every enforcement site reads, so the rule lives in one place:
+    **a rejected envelope is evidence, not a fact — it is stored and it is rendered, but
+    it never advances state.**
+
+    Note what this does NOT read. The marker is set from `accept`, never from `verified`.
+    An unsigned non-terminal frame and a deployment with no keyset both come back
+    `verified=True` — acceptance *by policy* rather than a check that passed, which is
+    what keeps `accept and not verified` meaning exactly the audit-mode population. The
+    population to refuse is `not accept`, and nothing else: treating a failed check as
+    the signal would also catch audit mode, where the whole point is that events keep
+    acting while an operator watches the reject rate.
+    """
+    return bool(event.get(KEY_REJECTED))
 
 
 def session_uuid(correlationid: str) -> str:
@@ -128,6 +171,17 @@ def to_kafka_binary(event: CloudEvent) -> tuple[list[tuple[str, bytes]], bytes]:
     for k, v in event.attrs.items():
         if v is None or v == "":
             continue
+        # #885 — the outbound half of `from_kafka_binary`'s refusal. A `__`-prefixed name
+        # is a local verdict (see KEY_REJECTED), so emitting one would put a decision
+        # this process made onto the wire, where the next consumer cannot tell it from a
+        # claim the publisher is entitled to make.
+        #
+        # Not reachable today: the marker is set on a plain dict after `envelope_dict`,
+        # the acting paths consume dicts, and `maybe_complete` builds a fresh event
+        # rather than re-serialising one. Symmetric anyway, because "unreachable" is a
+        # property of today's callers and the inbound filter is what the control rests on.
+        if k.startswith("__"):
+            continue
         headers.append((f"{CE_HEADER_PREFIX}{k}", str(v).encode("utf-8")))
     if event.data is None:
         value = b""
@@ -146,6 +200,17 @@ def from_kafka_binary(headers: Iterable[tuple[str, bytes | None]], value: bytes 
         if not k or not k.startswith(CE_HEADER_PREFIX):
             continue
         name = k[len(CE_HEADER_PREFIX):]
+        # #885 — refuse any `__`-prefixed name. These are local verdicts the consumer
+        # writes onto an envelope (see KEY_REJECTED), never wire attributes, and CloudEvents
+        # v1.0 restricts attribute names to [a-z0-9] so nothing legitimate is lost.
+        #
+        # Without this the marker IS forgeable: a header named `ce___rejected` strips to
+        # `__rejected`, and a forger who can set the marker can mark every GENUINE answer
+        # rejected — turning the control into a denial of service. Found by the test that
+        # was written to assert the opposite, which is why §8.5.4 asks the question
+        # instead of trusting the prefix argument.
+        if name.startswith("__"):
+            continue
         if v is None:
             continue
         attrs[name] = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
