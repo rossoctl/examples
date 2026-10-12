@@ -22,6 +22,10 @@ one the abstract cannot back without them:
                        terminal and group.completed onto the responses topic; the batch
                        does not settle, the genuine answer survives, and the attempt is
                        on record
+    audit trail        the topic read back with `audit_topic.py --chains`: which events
+                       are signed, and which result answers which signed wake event.
+                       Run AFTER the forgery on purpose — an audit that showed a clean
+                       topic after an attack would be worse than no audit
 
   python3 scripts/k8s_demo_flow.py                         # mock mode, free
   python3 scripts/k8s_demo_flow.py --overlay kind-signed   # + the signed beats
@@ -593,6 +597,49 @@ class Flow:
         self.c.note("signed / total events", f"{len(signed)} / {len(events)} "
                                              f"(terminal-only by policy, §4.4)")
 
+    def assert_audit_trail(self) -> None:
+        """R4: the broker log read back as an audit trail, after the forgery.
+
+        Runs `audit_topic.py --chains` for the operator-facing view and prints it, then
+        asserts the two facts the abstract's "tamper-evident audit" claim rests on: the
+        genuine run's result chains back to its *signed* wake event, and the forgery is
+        visible rather than indistinguishable.
+
+        Deliberately NOT `--verify`: that asserts a clean topic, and by this point the
+        topic contains the forgery the previous stage published. A demo that needed a
+        clean topic to pass would be a demo that cannot survive its own attack.
+        """
+        self.c.section("audit trail — results chain back to signed wakes (R4)")
+        import contextlib
+        import io
+
+        import audit_topic
+        argv = ["--namespace", self.ns, "--chains",
+                "--registry", self.args.registry, "--tag", self.args.tag]
+        if self.args.kubeconfig:
+            argv += ["--kubeconfig", self.args.kubeconfig]
+        if self.args.context:
+            argv += ["--context", self.args.context]
+        # Captured rather than streamed so the stage can assert on what the operator
+        # sees, then print it — the output IS the artifact this beat produces.
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                audit_topic.main(argv)
+        except SystemExit:
+            pass
+        out = buf.getvalue()
+        print(out.rstrip())
+        self.c.expect("BOUND" in out,
+                      "at least one result chains back to a verified wake event",
+                      out[-400:])
+        self.c.expect("terminals" in out, "the summary reports terminal coverage")
+        # The forgery from the previous stage must still be visible here. An audit tool
+        # that showed a clean topic after an attack would be worse than no tool.
+        self.c.expect("signed-BAD" in out or "UNVERIFIED" in out
+                      or "ORPHANED" in out or "unsigned" in out,
+                      "and the forged event is visible in the audit rather than hidden")
+
     def assert_forged_event_refused(self) -> None:
         """The money shot: publish a forgery onto the responses topic and watch it fail.
 
@@ -990,6 +1037,7 @@ def main(argv=None) -> int:
     if f.signed_beats:
         f.assert_signed_wake()
         f.assert_forged_event_refused()
+        f.assert_audit_trail()
         f.stage3()
     if not args.skip_cold_continue:
         f.stage2c()
