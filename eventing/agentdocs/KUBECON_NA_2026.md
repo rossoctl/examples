@@ -69,6 +69,32 @@ tracks each one separately.
 | D4 | completion bound to the wake event | ✅ `ce_causationid` |
 | D5 | scale to zero when agents are idle | ✅ measured, 30–31 s back to zero with `cooldownPeriod: 30` |
 
+### 1.2 The same commitments, restated as what must be on screen
+
+D1-D5 is the abstract's narrative order. Restated 2026-10-12 as the five things the demo
+has to *show*, which is sharper in two places and is the list to work from — R1 and R2 in
+particular are **not** what §2.1's seam rows were previously assessed against.
+
+| # | What must be on screen | State |
+|---|---|---|
+| **R1** | EventRunner does **not process any event** until an agent SVID is issued and verified — a sidecar reading SVIDs at runtime | ❌ no SPIRE anywhere; the runner reads a seed from a Secret **file** at startup and waits for nothing |
+| **R2** | The sender allowlist changes between submit and wake; the same event is accepted, then refused | ❌ **EventRunner never reads `ce_submitter`.** It verifies that EventBridge *signed*, not *who asked*. Needs a runner-side allowlist |
+| **R3** | Inject an event into the Kafka **requests** topic; EventRunner refuses it | 🟡 the control exists (`verify_request` → `rejected_unsigned`, agent never run) — no demo stage drives it |
+| **R4** | A utility listing events in a topic, showing which are signed and chaining results back to their signed wake | 🟡 `causationid` is in `SIGNED_ATTRS` so the chain is real; `watch_topics.py` reads **offsets only** and never consumes a message, so it cannot show a signature |
+| **R5** | KEDA scales from zero on task events and back to zero when idle | ✅ measured on two clusters |
+
+Three notes that matter more than the table:
+
+* **R1 forces the §3 SPIRE decision rather than deferring it.** But the demo-visible claim
+  is narrower than full SPIRE: "the runner does not consume until its identity is
+  established" is an initialization gate. Making the SVID *be* the signing key is what
+  needs the issuer-agnostic verifier (EC/RSA, §8.3) — the gate does not.
+* **R2 is why scale-to-zero is a security story, not just a cost story.** The runner loads
+  its allowlist at **startup**, so the drift window is real rather than contrived: edit the
+  list while replicas are 0 and the next wake enforces the new one. Say that out loud.
+* **R3 is a different topic and direction from #896's stage**, which forges a *response*.
+  Both are worth showing; neither substitutes for the other.
+
 ---
 
 ## 2. Status against the abstract
@@ -229,9 +255,14 @@ correlation id. For any conversation in a group, the capability is published.
 - No document records a run of it.
 - ~~`k8s_demo_flow.py --overlay` accepts only `test`, `kind`, `demo` — it **cannot drive
   `kind-signed`**.~~ **Closed by #896**: the overlay is a `--overlay` choice, and two
-  stages assert the signed wake (D2) and that a forged event published from an
+  stages assert the signed wake (D2) and that a forged **response** published from an
   in-cluster pod is refused.
 - Every signing result is unit-tested only.
+- **The forged-REQUEST path still has no stage.** `ER_REQUIRE_SIGNATURE=true` does
+  refuse an unsigned request (`consume.py` → `verify_request` → `rejected_unsigned`,
+  offset committed, agent never run), but nothing drives it. That is the demo beat the
+  abstract's "the event broker hands off events before signature check" actually names,
+  and it is a different topic and direction from the response-side stage above.
 
 **Still true as of 2026-10-12, and the distinction matters for the slide:** the script
 exists, nobody has run it against a cluster. So there is no measured on-cluster figure
@@ -311,9 +342,30 @@ assumes it is" warning that now has production callers.
 
 ### Recommendation
 
-**Option A, with one carve-out.** Reframe SPIRE as the upgrade path, *and* build the
-egress block (D3) with NetworkPolicy — which needs no SPIRE at all and restores the most
-visual demo beat. See W3 below.
+**Superseded 2026-10-12.** Option A was "reframe SPIRE as the upgrade path", which works
+only if no beat requires SPIRE to exist. §1.2's **R1 does** — "EventRunner does not
+process any event until an agent SVID is issued and verified" is a committed demo beat,
+and it cannot be narrated over a system with no SPIRE in it.
+
+**The option that was not on the list, and is the one to take: Option A′ — real SPIRE,
+identity gate only.** Deploy SPIRE server and agent on Kind. An init container blocks on
+the Workload API socket until an SVID is issued, and EventRunner refuses to start its
+consumer without one. The SVID is **not** the signing key: Ed25519 and the approved-key
+set keep doing signing exactly as they do now.
+
+That split is the whole point. It buys R1's visible claim — no SVID, no consumption, lag
+stays put; SVID issued, the agent wakes — while leaving the expensive half alone, because
+what §8.3 and §3/Option B actually cost is making the SVID the *verification* key: an
+issuer-agnostic verifier (EC/RSA added to hand-rolled pure-Python crypto, or relaxing
+§1.1 for `cryptography`) plus trust-bundle parsing and rotation. The gate needs none of
+it, and `_scalar_mult`'s "not side-channel resistant" warning stays off the critical path.
+
+Say the boundary out loud on the slide: **SPIRE gates whether the agent runs; it does not
+yet sign what the agent says.** That is a real seam closed and an honest one — and the
+upgrade path to Option B is unchanged and still named.
+
+The carve-out is withdrawn: D3 by NetworkPolicy does not enforce on kindnetd (§4/W3,
+§8.6), and §5/M3 already cuts the beat.
 
 ---
 
@@ -605,8 +657,8 @@ cluster leaves it at 3000 ms — so pick one for the recorded numbers and say wh
 | Seam | After M1-M4 |
 |---|---|
 | Unbound audit | ✅ closed — `ce_causationid` |
-| Unverified delivery | 🟡 signed and enforced (#955, #956); the cluster run is the one outstanding item |
-| Cold-start identity gap | ✅ demoed as the #888 asymmetry — now **before/after**, since the bug is fixed |
+| Unverified delivery | 🟡 signed and enforced (#955, #956). The **response** path has a demo stage; the **request** path (inject into the requests topic, runner refuses) does not yet, and the cluster run has not happened |
+| Cold-start identity gap | ❌ **not demoed.** The #888 asymmetry is a *different* gap and #888 is fixed, so it is before/after commentary rather than a beat. The committed beat is "the runner does not process events until its SVID is issued and verified", and there is no SPIRE |
 | Trust-scope drift | 🟡 named, with the deploy-time-allowlist limit stated and §8.3's SPIRE obstacles given |
 
 Plus the §8 section (§6.3 below), which is the differentiator and needs no engineering at
