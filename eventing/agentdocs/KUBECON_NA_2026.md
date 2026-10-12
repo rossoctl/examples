@@ -64,7 +64,7 @@ tracks each one separately.
 | # | Beat | Backed by |
 |---|---|---|
 | D1 | zero agent replicas | ✅ KEDA `minReplicaCount: 0`, measured |
-| D2 | signed task event → agent wake | 🟡 JWS real, never run on a cluster |
+| D2 | signed task event → agent wake | 🟡 JWS real and enforced; the demo can now drive it (#896), but **the run has not happened** |
 | D3 | blocked egress on a wrong-scope call | ❌ **no implementation at all** |
 | D4 | completion bound to the wake event | ✅ `ce_causationid` |
 | D5 | scale to zero when agents are idle | ✅ measured, 30–31 s back to zero with `cooldownPeriod: 30` |
@@ -76,6 +76,11 @@ tracks each one separately.
 Assessed 2026-10-05 against `main`. Method: read all nine `agentdocs/` files and the
 full source, then **ran the identity decision functions** rather than trusting
 docstrings — which is `DESIGN_PHASE2.md` §8.6's rule, and it changed two conclusions.
+
+**Refreshed 2026-10-12** for the §8 bug fixes (§2.4, §2.5) and for #896 closing the
+"nothing can drive `kind-signed`" gap (§2.6). The seam and beat tables above are
+updated; the test figures below are from the original assessment and are the ones to
+re-measure before the talk.
 
 Test suite at review time: **904 collected**. On CI, 896 passed and 8 skipped; on a
 laptop with the `claude` CLI on `PATH`, 899 passed and 5 skipped — the three extra CI
@@ -92,7 +97,7 @@ not a live count — see §5/M4 before touching it.)
 | Cold-start identity gap | SPIRE → KEDA | ❌ **No SPIRE/SPIFFE/SVID in `eventing/`.** 8 mentions across 4 files, all prose, all aspirational. (`mcp/wiki_memory_tool/` does ship header-simulated SPIFFE identity — a different component, and its own README notes there is no real SVID verification) |
 | Trust-scope drift | SPIRE → egress sidecar | ❌ **No NetworkPolicy, no Istio, no AuthorizationPolicy, no sidecar** |
 | Unverified delivery | CloudEvents verifier → Knative trigger | 🟡 Verification exists and is real; **no Knative** (Strimzi instead, which the abstract permits) |
-| Unbound audit | event bus → work record | 🟡 `ce_causationid` binds response to request; **the replay path verifies nothing** |
+| Unbound audit | event bus → work record | 🟡 `ce_causationid` binds response to request; the replay path now verifies `group.completed` and lets a verified member terminal outrank an unverified one (#955, #956) — it cannot refuse unsigned pre-signing history, which is a property of the history rather than of the check |
 
 ### 2.2 What is genuinely done and demo-ready
 
@@ -129,20 +134,28 @@ a challenge; the code has it.
 
 ### 2.4 Confirmed by running the code
 
-<!-- VERIFY v0.9.0: this table describes #888 and #885 while they are open. Once
-     rossoctl/examples#888 lands, "refuses nothing without a keyset" becomes false and the
-     row should say what the fail-closed behaviour is; once #885 lands, drop the
-     rewrite-still-applies row. Do not delete the table — it is §5/M3's demo beat. -->
-
-Not from docstrings. These five lines are the honest state of response verification:
+Not from docstrings. These five lines are the honest state of response verification —
+**updated 2026-10-12, after #888 and #885 landed.** The before column is kept because the
+contrast is §5/M3's demo beat: the asymmetry is the point, not the bug.
 
 ```
-A) require=True, keyset=None        -> ACCEPTED  ("verification not enabled")   ← #888
-B) forged unsigned terminal         -> refused   ✅
-C) signed by unapproved kid         -> refused   ✅
-D) forged unsigned NON-terminal     -> ACCEPTED  (by design, see below)
-E) forged group.completed, enforced -> refused by verifier… then applied anyway ← #885
+                                       at the 2026-10-05 review        now
+A) require=True, keyset=None        -> ACCEPTED ("not enabled")  ← #888   refuses, loudly
+B) forged unsigned terminal         -> refused  ✅                        refused  ✅
+C) signed by unapproved kid         -> refused  ✅                        refused  ✅
+D) forged unsigned NON-terminal     -> ACCEPTED (by design)               ACCEPTED (by design)
+E) forged group.completed, enforced -> refused… then applied     ← #885   refused AND inert
 ```
+
+Two rows moved, and both are worth saying out loud because they are the talk's subject:
+
+* **(A)** was the sharpest finding in the whole review — enforcement on, no keyset,
+  refusing nothing while the banner said `OFF`, against a request side that refused
+  *everything* in the same configuration. Now both sides fail closed.
+* **(E)** was refused by the verifier and applied anyway. Now a refused event is inert as
+  well as marked: it reaches neither `on_group_event`, `on_member_event`, nor a sequence
+  a verified row already holds (#955), and the group mirror no longer re-applies forged
+  member terminals on restart (#956).
 
 **(D) is a deliberate policy, not a bug.** `emit()` signs terminal events only, because
 it runs per `stdout` frame and Ed25519 costs **222 ms to sign, 227 ms to verify** here
@@ -151,37 +164,59 @@ estimate); signing every frame would
 add minutes to a chatty run. The verifier matches that policy. The honest limit: this
 proves *who finished a run*, not *what it said along the way*. Say that on stage.
 
-**(E) is the one that will bite on stage.** `signing.response_decision` correctly refuses
-the forged `group.completed`. But `kafka_in.py:138` rewrites only `phase` and `data` — it
-preserves `type` and `groupid`, then routes on `is_group_event(evt)` using the
-**original** event. `group_service.on_group_event` reads only those two fields, so it
-calls `complete_group()` anyway. A forged event the verifier *correctly rejected* still
-ends the batch and fires a "100 finished" notification for work that never ran. The group
-mirror also replays group events with **no verification at all** on restart.
+**(E) was the one that would have bitten on stage, and it is the best story in the deck.**
+`signing.response_decision` correctly refused the forged `group.completed` — and the
+batch completed anyway, because the rewrite preserved `type` and `groupid` and the
+routing read the *original* event. A forged event the verifier *correctly rejected* still
+ended the batch and fired a "finished" notification for work that never ran. Worse, the
+genuine answer arriving afterwards was then discarded as a duplicate, so the forgery did
+not merely add a lie — it destroyed the truth.
 
-So "the event broker log is tamper-evident audit" is currently half-true: the log is
-replayable, but the replay trusts it unconditionally.
+Measured before/after, enforcement on, a 2-agent batch:
 
-### 2.5 Open bugs, all still open
+```
+before: completed_utc set with 1 of 2 agents terminal
+        counts {finished: 0, failed: 1}        <- the agent had SUCCEEDED
+        [groups] duplicate terminal event ... ignored   <- the real answer, dropped
+after:  batch open, transcript holds the genuine answer, rejected=2
+```
 
-<!-- VERIFY v0.9.0: re-check each of rossoctl/examples#885-#889 before the talk. "All still
-     open" is the claim with the shortest shelf life in this document, and §5/M1 and M4 are
-     the work that invalidates it. Update the row rather than the heading. -->
+**This is the talk's thesis with a measurement attached**: a control that computes the
+right verdict and does not act on it. The verdict was never wrong; the path to the
+outcome was never followed. That is `DESIGN_PHASE2.md` §8.5.1 — *a claim about an
+outcome has to follow the path to that outcome, not stop at the check* — and the test
+that was supposed to catch it asserted the verdict on a callback dict, so it could not
+have.
 
-From the `DESIGN_PHASE2.md` §8 docs review. None fixed as of 2026-10-05.
+So "the event broker log is tamper-evident audit" is now true for the paths that act on
+it, with one residual stated honestly: the log is replayable, and what the replay trusts
+is bounded by what a signature can prove about a record published before signing existed.
 
-| Issue | What |
-|---|---|
-| [#885](https://github.com/rossoctl/examples/issues/885) | Response-signature enforcement is advisory — rejected events still end batches and overwrite verified answers |
-| [#886](https://github.com/rossoctl/examples/issues/886) | Audit mode records nothing, so the documented two-flag rollout cannot be performed |
-| [#887](https://github.com/rossoctl/examples/issues/887) | Unauthenticated `PUT /transcript` rewrites what an agent resumes from; correlation ids are listable |
-| [#888](https://github.com/rossoctl/examples/issues/888) | `EB_REQUIRE_RESPONSE_SIGNATURE` without a keyset refuses nothing and reports nothing |
-| [#889](https://github.com/rossoctl/examples/issues/889) | Stale pidfile naming PID 1 crash-loops the pod after an abrupt exit |
+### 2.5 The §8 bugs, four of five now fixed
 
-#888 is the sharpest asymmetry and the easiest for a reviewer to find: the response side
-with enforcement on and no keyset refuses **nothing** while printing
+From the `DESIGN_PHASE2.md` §8 docs review. All five were open at the 2026-10-05
+assessment; **as of 2026-10-12 only #887 remains**, which changes what the §8 section can
+be demoed as — see the note under the table.
+
+| Issue | What | State |
+|---|---|---|
+| [#885](https://github.com/rossoctl/examples/issues/885) | Response-signature enforcement is advisory — rejected events still end batches and overwrite verified answers | **fixed** (#955) |
+| [#886](https://github.com/rossoctl/examples/issues/886) | Audit mode records nothing, so the documented two-flag rollout cannot be performed | **fixed** (#902) |
+| [#887](https://github.com/rossoctl/examples/issues/887) | Unauthenticated `PUT /transcript` rewrites what an agent resumes from; correlation ids are listable | open — mitigate operationally, §5 cuts it |
+| [#888](https://github.com/rossoctl/examples/issues/888) | `EB_REQUIRE_RESPONSE_SIGNATURE` without a keyset refuses nothing and reports nothing | **fixed** |
+| [#889](https://github.com/rossoctl/examples/issues/889) | Stale pidfile naming PID 1 crash-loops the pod after an abrupt exit | **fixed** (#901) |
+
+Plus [#956](https://github.com/rossoctl/examples/issues/956), **fixed**, which #885's fix
+did not reach: the group mirror re-applied forged member terminals on replay, so a
+restart put a batch back to `failed: 1` for an agent that had succeeded.
+
+**#888 was the sharpest asymmetry and it is no longer live, which affects §5/M3.** The
+response side with enforcement on and no keyset refused **nothing** while printing
 `response verification OFF`; the request side with `ER_REQUIRE_SIGNATURE=true` and no key
-refuses **everything**. Both were documented as "refusal is on." Only one was true.
+refused **everything**. Both were documented as "refusal is on." Only one was true. M3
+proposed demoing that asymmetry in place of the cut egress beat — so demo it
+**before/after** rather than live, since the bug no longer reproduces. The asymmetry is
+the point, not the bug.
 
 #887 also defeats Phase 2 §3.1's capability-URL argument: `GET /v0/groups` returns the
 100 most recent groups without sign-in, and `/v0/groups/{id}/status` lists every member's
@@ -192,9 +227,17 @@ correlation id. For any conversation in a group, the capability is published.
 `k8s/overlays/kind-signed/` exists and is carefully written. But:
 
 - No document records a run of it.
-- `k8s_demo_flow.py --overlay` accepts only `test`, `kind`, `demo` — it **cannot drive
-  `kind-signed`**.
+- ~~`k8s_demo_flow.py --overlay` accepts only `test`, `kind`, `demo` — it **cannot drive
+  `kind-signed`**.~~ **Closed by #896**: the overlay is a `--overlay` choice, and two
+  stages assert the signed wake (D2) and that a forged event published from an
+  in-cluster pod is refused.
 - Every signing result is unit-tested only.
+
+**Still true as of 2026-10-12, and the distinction matters for the slide:** the script
+exists, nobody has run it against a cluster. So there is no measured on-cluster figure
+for signing cost or for a wake latency that includes it — §6.1's instruction to say which
+cluster a number comes from applies doubly here, because the honest answer is currently
+"none". The remaining work on this beat is an execution, not a build.
 
 This matters because of this repository's own precedent: `DESIGN_PHASE2.md` §4.4 step 2
 records that the signer/verifier policy mismatch (signing terminals only, verifying
@@ -422,8 +465,8 @@ at risk.
 
 | | Item | Effort | Tracked | Blocks |
 |---|---|---|---|---|
-| **M1** | Fix #888, then #885 | ~0.5 d | [#895](https://github.com/rossoctl/examples/issues/895) | M2 |
-| **M2** | Run `kind-signed` end to end | ~1 d | [#896](https://github.com/rossoctl/examples/issues/896) | the recording |
+| **M1** | ~~Fix #888, then #885~~ — **done** (#955, plus #956) | ~0.5 d | [#895](https://github.com/rossoctl/examples/issues/895) closed | M2 |
+| **M2** | Run `kind-signed` end to end — **script built, run outstanding** | ~1 d | [#896](https://github.com/rossoctl/examples/issues/896) | the recording |
 | **M3** | Substitute the egress beat | a decision | — | the demo list |
 | **M4** | #889 + the honesty pass | ~2 h | #889 | — |
 
@@ -562,8 +605,8 @@ cluster leaves it at 3000 ms — so pick one for the recorded numbers and say wh
 | Seam | After M1-M4 |
 |---|---|
 | Unbound audit | ✅ closed — `ce_causationid` |
-| Unverified delivery | ✅ closed — signed, enforced, **and run on a cluster** |
-| Cold-start identity gap | ✅ demoed as the #888 asymmetry, named honestly |
+| Unverified delivery | 🟡 signed and enforced (#955, #956); the cluster run is the one outstanding item |
+| Cold-start identity gap | ✅ demoed as the #888 asymmetry — now **before/after**, since the bug is fixed |
 | Trust-scope drift | 🟡 named, with the deploy-time-allowlist limit stated and §8.3's SPIRE obstacles given |
 
 Plus the §8 section (§6.3 below), which is the differentiator and needs no engineering at
