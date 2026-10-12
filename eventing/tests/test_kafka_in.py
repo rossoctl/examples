@@ -640,3 +640,24 @@ def test_the_rejection_marker_cannot_arrive_from_the_wire(tmp_path, monkeypatch)
     assert c.rejected == 0, "the wire must not be able to mark an event rejected"
     assert seen and not ce.is_rejected(seen[0])
     assert store.events_for("brave-otter-4718")[0]["phase"] == "result"
+
+
+def test_the_rejection_marker_is_never_emitted_onto_the_wire(tmp_path):
+    """The outbound half of the same invariant.
+
+    `from_kafka_binary` refusing `__`-prefixed names is what makes the marker
+    unforgeable; `to_kafka_binary` refusing to emit them is what stops this process
+    publishing its own local verdict as though it were a claim the next consumer could
+    rely on. Unreachable through today's callers — the marker is set on a plain dict
+    after `envelope_dict` — which is exactly why it is pinned rather than argued.
+    """
+    evt = ce.new_event(type=ce.TYPE_RESPONSE, source="s",
+                       datacontenttype="application/json",
+                       correlationid="brave-otter-4718", sequence=1, phase="result",
+                       final="true", data={"text": "hi"})
+    evt.attrs[ce.KEY_REJECTED] = "true"
+    headers, _ = ce.to_kafka_binary(evt)
+    assert not [k for k, _ in headers if "__" in k], \
+        "a local verdict must not become a wire attribute"
+    assert not ce.is_rejected(ce.from_kafka_binary(*ce.to_kafka_binary(evt))), \
+        "and must not survive a round trip"

@@ -80,10 +80,28 @@ class GroupMirror(threading.Thread):
         # an `emptyDir` — so refusing unsigned records would lose every group's state on
         # every restart, which is the exact failure this module was written to prevent.
         #
-        # `group.completed` is the only mirror path that can settle a batch:
+        # `group.completed` is the only mirror path that can SETTLE a batch:
         # `on_member_event(replay=True)` returns before `maybe_complete`, and a forged
         # `group.started` creates an empty group row, which is noise rather than a
         # settled batch reporting work that never ran.
+        #
+        # **What this does NOT cover**, stated because the guard reads as if it did:
+        # `on_member_event(replay=True)` runs `add_group_member` and
+        # `mark_member_finished` BEFORE its `replay` check, and the rejection marker is
+        # local rather than on the wire — so a forged terminal lying earlier in the topic
+        # than the genuine answer wins `finished_utc IS NULL` again on every start, and
+        # the batch reads back `failed: 1` for an agent that succeeded. Bounded: the
+        # batch stays open, because `complete_group` is guarded and `maybe_complete` is
+        # skipped. Worst exactly here, though — with a PVC the live run's `finished_utc`
+        # already blocks the replay, while on the `test`/`kind` overlays /data is an
+        # `emptyDir` and the replay IS the state.
+        #
+        # VERIFY: not fixable by widening this check. Verifying member events on replay
+        # needs the runner keyset with require=True, which refuses every pre-signing
+        # record, and "verify only when a signature is present" is not a control because
+        # a forger omits it. The fix is a replay that cannot regress a member already
+        # terminal in the store — a store change, not a mirror one. Keep the paragraph
+        # above when that lands; it is why the scope is what it is.
         self._keyset = keyset
         self._bridge_kid = bridge_kid
         # Partitions are assigned by hand and nothing is ever committed: the whole

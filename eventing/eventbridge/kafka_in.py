@@ -27,13 +27,19 @@ destroyed the truth. A rejected envelope is therefore marked with `ce.KEY_REJECT
 reaches no acting path: not `on_group_event`, not `on_member_event`, and not a sequence
 a non-rejected row already holds.
 
-**The guard reads `ok`, never `verified`, and that is load-bearing.** An unsigned
-non-terminal frame and a deployment with no keyset both report `verified=False` while
-being accepted *by policy* — `emit()` signs terminal events only, because a signature
-costs ~222 ms and signing every stdout frame would add minutes to a chatty run. Keying
-the guard on `verified` would stop every streamed frame of every genuine run from
-acting, which is the §4.4 step 2 mistake: it rewrote every frame of every run to
-`phase="error"` and was found against a live broker, by no unit test.
+**The guard reads `ok`, never `verified`, and that is load-bearing.** `emit()` signs
+terminal events only, because a signature costs ~222 ms and signing every stdout frame
+would add minutes to a chatty run, so an unsigned non-terminal frame is accepted *by
+policy*. `response_decision` reports those — and a deployment with no keyset — as
+`verified=True`, acceptance by policy rather than a check that passed, which is what
+keeps `accept and not verified` meaning the audit-mode population and nothing else.
+
+So the population to refuse is `not ok`. Keying the guard on `verified` would be wrong
+in both directions: it would spare nothing extra, and it would make audit mode inert,
+where the whole point is that events keep acting while the reject rate is watched.
+Getting this backwards is the §4.4 step 2 mistake — verifying all-or-nothing rewrote
+every streamed frame of every genuine run to `phase="error"`, and it was found against a
+live broker, by no unit test.
 """
 from __future__ import annotations
 
@@ -210,11 +216,11 @@ class Consumer(threading.Thread):
                     # but no `correlationid`, so handing it to insert_response would
                     # violate that table's (correlationid, sequence) primary key.
                     if ce.is_group_event(evt):
-                        # #885 — `ok`, not `verified`. An unsigned non-terminal frame and
-                        # a deployment with no keyset both report `verified=False` while
-                        # being accepted BY POLICY, and skipping those would stop every
-                        # streamed frame of every genuine run from reaching the group
-                        # service. Only `not ok` is the enforcement-refused population.
+                        # #885 — `ok`, not `verified`. Those are different questions:
+                        # `verified` is False only for a check that FAILED, which audit
+                        # mode accepts on purpose, while `not ok` is the
+                        # enforcement-refused population and the only one to skip. See
+                        # the module docstring.
                         #
                         # The group service refuses a marked envelope too (§885's single
                         # rule), so this is the source-side half of a rule enforced at

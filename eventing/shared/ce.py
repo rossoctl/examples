@@ -128,11 +128,13 @@ def is_rejected(event) -> bool:
     **a rejected envelope is evidence, not a fact — it is stored and it is rendered, but
     it never advances state.**
 
-    Note what this does NOT read. The verdict is `accept`, never `verified`: an unsigned
-    non-terminal frame and a deployment with no keyset both come back `verified=False`
-    while being accepted *by policy*, and treating those as rejected would stop every
-    streamed frame of every genuine run from acting. That is the §4.4 step 2 mistake,
-    which was found against a live broker and by no unit test.
+    Note what this does NOT read. The marker is set from `accept`, never from `verified`.
+    An unsigned non-terminal frame and a deployment with no keyset both come back
+    `verified=True` — acceptance *by policy* rather than a check that passed, which is
+    what keeps `accept and not verified` meaning exactly the audit-mode population. The
+    population to refuse is `not accept`, and nothing else: treating a failed check as
+    the signal would also catch audit mode, where the whole point is that events keep
+    acting while an operator watches the reject rate.
     """
     return bool(event.get(KEY_REJECTED))
 
@@ -168,6 +170,17 @@ def to_kafka_binary(event: CloudEvent) -> tuple[list[tuple[str, bytes]], bytes]:
     headers: list[tuple[str, bytes]] = []
     for k, v in event.attrs.items():
         if v is None or v == "":
+            continue
+        # #885 — the outbound half of `from_kafka_binary`'s refusal. A `__`-prefixed name
+        # is a local verdict (see KEY_REJECTED), so emitting one would put a decision
+        # this process made onto the wire, where the next consumer cannot tell it from a
+        # claim the publisher is entitled to make.
+        #
+        # Not reachable today: the marker is set on a plain dict after `envelope_dict`,
+        # the acting paths consume dicts, and `maybe_complete` builds a fresh event
+        # rather than re-serialising one. Symmetric anyway, because "unreachable" is a
+        # property of today's callers and the inbound filter is what the control rests on.
+        if k.startswith("__"):
             continue
         headers.append((f"{CE_HEADER_PREFIX}{k}", str(v).encode("utf-8")))
     if event.data is None:
