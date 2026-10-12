@@ -166,9 +166,22 @@ class GroupService:
         if not final:
             store.mark_member_running(groupid, corr)
             return
-        first = store.mark_member_finished(groupid, corr,
-                                           event.get("phase") or "result")
+        phase = event.get("phase") or "result"
+        # #956 — the mirror sets this on a replayed terminal whose signature checked out.
+        # Absent on the live path (where a failed verification is already inert, #885)
+        # and in every unsigned deployment, so the default is the truthful "nothing has
+        # been proved about this row".
+        verified = bool(event.get(ce.KEY_REPLAY_VERIFIED))
+        first = store.mark_member_finished(groupid, corr, phase, verified=verified)
         if replay:
+            # #956 — ordering on the topic must not decide which terminal wins. If this
+            # one verifies and the recorded one did not, it outranks it; otherwise
+            # nothing moves. One-way, so a forger cannot use it to overwrite a genuine
+            # answer — that would need a valid signature from an approved key.
+            if not first and verified and store.upgrade_member_terminal(
+                    groupid, corr, phase):
+                _log(f"replay: a verified terminal for {groupid}/{corr} "
+                     f"outranks the unverified one on record")
             return
         if not first:
             # A redelivered terminal event. Counting it again is exactly the bug §21.5

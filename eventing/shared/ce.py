@@ -109,6 +109,13 @@ CORE_ATTRS = {"specversion", "type", "source", "id", "time",
 # mark every genuine answer rejected, which is a denial of service rather than a
 # bypass — the control inverted instead of removed. `test_kafka_in.py` pins the refusal.
 KEY_REJECTED = "__rejected"
+# #956 — set by the group mirror on a replayed member terminal whose signature checked
+# out, so `GroupService` can let it outrank an unverified terminal already recorded. Same
+# `__` convention and the same codec refusal as KEY_REJECTED, for the same reason: it is
+# a verdict this process computed, not a claim a publisher is entitled to make. The
+# marker only ever moves a member from unverified to verified, so a forger gains nothing
+# by wanting it — they would still need a valid signature from an approved key.
+KEY_REPLAY_VERIFIED = "__replay_verified"
 
 
 def is_group_event(event) -> bool:
