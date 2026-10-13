@@ -78,10 +78,22 @@ p = KafkaProducer(bootstrap_servers=%(bootstrap)r, acks="all", retries=3)
 
 # 1. A forged terminal for a member that already answered: overwrite the real answer
 #    and fail a healthy agent.
+#
+#    **The sequence is chosen NOT to collide**, which is the opposite of what an
+#    attacker would do and is deliberate. `next_seq` starts at 1, so a forgery at
+#    `sequence=1` always lands on a sequence the genuine run already holds — and #955's
+#    store rule then refuses the rejected row rather than storing it. That is the
+#    STRONGER outcome, but it leaves no row carrying `data.signature_rejected`, so the
+#    "the refusal is on record" half of the beat finds nothing and fails for a reason
+#    that has nothing to do with signing.
+#
+#    So: a high sequence for the recorded beat, and `--forge-collide` on the flow to
+#    demonstrate the collision case separately, where the assertion is that the genuine
+#    row SURVIVES rather than that a rejection was stored.
 member = ce.new_event(
     type=ce.TYPE_RESPONSE, source="rossoctl://attacker/forge",
     datacontenttype="application/json", correlationid=CORR,
-    sessionuuid=ce.session_uuid(CORR), sequence=1, phase="error", final="true",
+    sessionuuid=ce.session_uuid(CORR), sequence=%(seq)d, phase="error", final="true",
     groupid=GID, data={"text": "Ship the goods", "role": "final"})
 
 # 2. A forged group.completed: end the batch early and page the operator with a
@@ -705,12 +717,24 @@ class Flow:
                       "and the forged text is nowhere in the victim's transcript")
         rejected = [r for r in rows
                     if (r.get("data") or {}).get("signature_rejected")]
-        self.c.expect(bool(rejected),
-                      f"the refusal is ON RECORD rather than dropped "
-                      f"({len(rejected)} rejected row(s)) — §4.4, a drop is "
-                      f"indistinguishable from an agent that never answered")
-        if rejected:
-            self.c.log(f"  reason: {(rejected[0].get('data') or {}).get('reason')!r}")
+        if self.args.forge_collide:
+            # The forgery reused a sequence the genuine run holds, so #955's store rule
+            # refused it the row entirely. Nothing to find — and that is the stronger
+            # outcome, so assert THAT rather than the forensic row.
+            self.c.expect(not rejected,
+                          "a forgery reusing a verified row's sequence is refused the "
+                          "row outright (#955) — no rejection is stored because none "
+                          "could be written without destroying the genuine answer")
+            self.c.log("  (--forge-collide: the audit evidence is the surviving "
+                       "genuine row, not a rejection row)")
+        else:
+            self.c.expect(bool(rejected),
+                          f"the refusal is ON RECORD rather than dropped "
+                          f"({len(rejected)} rejected row(s)) — §4.4, a drop is "
+                          f"indistinguishable from an agent that never answered")
+            if rejected:
+                self.c.log(f"  reason: "
+                           f"{(rejected[0].get('data') or {}).get('reason')!r}")
         logs = self.k.logs("deploy/eventbridge", namespace=self.ns, tail=200) or ""
         self.c.expect("unverified response" in logs,
                       "and the bridge logged it, so an operator can see the attempt")
@@ -736,8 +760,11 @@ class Flow:
         bootstrap = dig(cfg, "data", "KAFKA_BOOTSTRAP") or \
             "my-cluster-kafka-bootstrap.kafka.svc:9092"
         topic = dig(cfg, "data", "RESPONSE_TOPIC") or "kev1-responses"
+        # A sequence the genuine run cannot already hold (next_seq starts at 1), unless
+        # --forge-collide asks for the collision case on purpose.
+        seq = 1 if self.args.forge_collide else 9001
         forge = FORGE_SRC % {"topic": topic, "gid": gid, "corr": victim,
-                             "bootstrap": bootstrap}
+                             "bootstrap": bootstrap, "seq": seq}
         name = f"forger-{int(time.time())}"
         self.c.log(f"  publishing from a throwaway pod -> {topic} @ {bootstrap}")
         res = self.k.call(
@@ -1006,6 +1033,11 @@ def build_args(argv=None):
                          "refused. Default on for --overlay kind-signed")
     ap.add_argument("--no-signed-beats", dest="signed_beats", action="store_false",
                     help="skip the signed beats even on an enforcing overlay")
+    ap.add_argument("--forge-collide", action="store_true",
+                    help="publish the forged terminal at sequence 1, colliding with the "
+                         "genuine run's first event. #955's store rule then refuses it "
+                         "the row outright, so the evidence is the surviving genuine "
+                         "answer rather than a stored rejection")
     ap.add_argument("--skip", default="")
     ap.add_argument("--phase", default="pre")
     ap.add_argument("--url", default=None)

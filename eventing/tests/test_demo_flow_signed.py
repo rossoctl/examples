@@ -80,7 +80,7 @@ def test_the_signed_beats_can_be_forced_either_way():
 # ---- the forgery is the real thing ------------------------------------------
 
 def _run_forge(topic="kev1-responses", gid="test-group-0001",
-               corr="test-agent-0001", bootstrap="broker:9092"):
+               corr="test-agent-0001", bootstrap="broker:9092", seq=9001):
     """Execute FORGE_SRC with a fake KafkaProducer, returning what it published.
 
     The source is run rather than parsed, because the thing under test is that the
@@ -99,7 +99,7 @@ def _run_forge(topic="kev1-responses", gid="test-group-0001",
             pass
 
     src = flow.FORGE_SRC % {"topic": topic, "gid": gid, "corr": corr,
-                            "bootstrap": bootstrap}
+                            "bootstrap": bootstrap, "seq": seq}
     fake_kafka = type(sys)("kafka")
     fake_kafka.KafkaProducer = _Producer
     saved = sys.modules.get("kafka")
@@ -158,3 +158,25 @@ def test_the_forged_member_terminal_claims_to_be_terminal():
     assert str(evt.get("final")).lower() == "true"
     assert evt.get("phase") == "error"
     assert "Ship the goods" in str(evt.data)
+
+
+def test_the_forged_terminal_does_not_reuse_the_genuine_runs_first_sequence():
+    """Found in review, before the first cluster run: a forgery at `sequence=1` always
+    collides, because `Emitter.next_seq` returns 1 for a genuine run's first event.
+
+    #955's store rule then refuses the rejected row rather than storing it — the
+    STRONGER outcome — but it leaves no row carrying `data.signature_rejected`, so the
+    "the refusal is on record" assertion finds nothing and the beat fails for a reason
+    that has nothing to do with signing. The default must therefore not collide.
+    """
+    member = _run_forge()[0]
+    evt = ce.from_kafka_binary([(k, v) for k, v in member[3]], member[2])
+    assert int(evt.get("sequence")) > 1, \
+        "the default forgery must not land on a sequence the genuine run holds"
+
+
+def test_the_collision_case_is_still_reachable_on_purpose():
+    """It is the more interesting outcome, so it stays available — just not as the
+    default, and with the assertion pointed at the surviving genuine row instead."""
+    assert _flow("kind-signed").args.forge_collide is False
+    assert _flow("kind-signed", "--forge-collide").args.forge_collide is True

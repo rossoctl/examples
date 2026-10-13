@@ -280,11 +280,20 @@ class GroupMirror(threading.Thread):
                 # pre-signing one are byte-identical, so refusing on replay would refuse
                 # the history this mirror exists to rebuild.
                 #
-                # Cheap where it matters. `response_decision` short-circuits an event
-                # with no signature before any curve arithmetic (measured: 0.00 ms
-                # against ~142 ms for a signed one), so a topic full of pre-signing
-                # records costs nothing and only genuinely signed terminals pay — in the
-                # only deployment that has them.
+                # **What this costs, stated per case rather than as one number.**
+                # `response_decision` short-circuits an event with no signature before
+                # any curve arithmetic, so a topic of pre-signing records — the big-topic
+                # case, and the reason refusal was not an option — adds nothing
+                # measurable. An event that DOES carry a signature pays a full verify
+                # (190-230 ms, `IMPLEMENTATION_REPORT1.md` §9) whether or not it turns
+                # out to be valid.
+                #
+                # So the honest version is not "only genuine terminals pay": the
+                # short-circuit is on a MISSING signature, not a bad one, which means a
+                # forger who attaches any signature at all chooses to make the bridge
+                # pay. That is §8.5.4 asked about cost instead of correctness. Bounded
+                # here because the mirror is one-shot at startup and only terminals are
+                # checked, but it is a real asymmetry and not a free check.
                 if (self._keyset is not None
                         and str(d.get("final", "false")).lower() == "true"):
                     try:
