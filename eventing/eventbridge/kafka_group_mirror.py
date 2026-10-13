@@ -85,23 +85,19 @@ class GroupMirror(threading.Thread):
         # `group.started` creates an empty group row, which is noise rather than a
         # settled batch reporting work that never ran.
         #
-        # **What this does NOT cover**, stated because the guard reads as if it did:
-        # `on_member_event(replay=True)` runs `add_group_member` and
-        # `mark_member_finished` BEFORE its `replay` check, and the rejection marker is
-        # local rather than on the wire — so a forged terminal lying earlier in the topic
-        # than the genuine answer wins `finished_utc IS NULL` again on every start, and
-        # the batch reads back `failed: 1` for an agent that succeeded. Bounded: the
-        # batch stays open, because `complete_group` is guarded and `maybe_complete` is
-        # skipped. Worst exactly here, though — with a PVC the live run's `finished_utc`
-        # already blocks the replay, while on the `test`/`kind` overlays /data is an
-        # `emptyDir` and the replay IS the state.
+        # **Member terminals are handled differently, by precedence (#956).** They used
+        # to replay unverified, so a forged terminal lying earlier in the topic than the
+        # genuine answer won `finished_utc IS NULL` on every start and the batch read
+        # back `failed: 1` for an agent that succeeded — worst exactly here, since with a
+        # PVC the live run's `finished_utc` already blocks the replay while on the
+        # `test`/`kind` overlays /data is an `emptyDir` and the replay IS the state.
         #
-        # VERIFY: not fixable by widening this check. Verifying member events on replay
-        # needs the runner keyset with require=True, which refuses every pre-signing
-        # record, and "verify only when a signature is present" is not a control because
-        # a forger omits it. The fix is a replay that cannot regress a member already
-        # terminal in the store — a store change, not a mirror one. Keep the paragraph
-        # above when that lands; it is why the scope is what it is.
+        # Refusal is not available for them: a forged unsigned terminal and a genuine
+        # pre-signing one are byte-identical, so refusing would refuse the history this
+        # mirror exists to rebuild. Instead a VERIFIED terminal outranks an unverified
+        # one whatever order the topic holds them in (`_apply`, and
+        # `Store.upgrade_member_terminal`). The upgrade is one-way, so a forger gains
+        # nothing: moving a member needs a valid signature from an approved key.
         self._keyset = keyset
         self._bridge_kid = bridge_kid
         # Partitions are assigned by hand and nothing is ever committed: the whole
@@ -278,6 +274,37 @@ class GroupMirror(threading.Thread):
                 self._groups.on_group_event(d, replay=True)
                 self.rebuilt_groups += 1
             else:
+                # #956 — a member terminal that VERIFIES outranks an unverified one
+                # already recorded, whatever order the topic holds them in. Precedence
+                # rather than refusal: a forged unsigned terminal and a genuine
+                # pre-signing one are byte-identical, so refusing on replay would refuse
+                # the history this mirror exists to rebuild.
+                #
+                # **What this costs, stated per case rather than as one number.**
+                # `response_decision` short-circuits an event with no signature before
+                # any curve arithmetic, so a topic of pre-signing records — the big-topic
+                # case, and the reason refusal was not an option — adds nothing
+                # measurable. An event that DOES carry a signature pays a full verify
+                # (190-230 ms, `IMPLEMENTATION_REPORT1.md` §9) whether or not it turns
+                # out to be valid.
+                #
+                # So the honest version is not "only genuine terminals pay": the
+                # short-circuit is on a MISSING signature, not a bad one, which means a
+                # forger who attaches any signature at all chooses to make the bridge
+                # pay. That is §8.5.4 asked about cost instead of correctness. Bounded
+                # here because the mirror is one-shot at startup and only terminals are
+                # checked, but it is a real asymmetry and not a free check.
+                if (self._keyset is not None
+                        and str(d.get("final", "false")).lower() == "true"):
+                    try:
+                        ok, _why, verified = signing.response_decision(
+                            evt, self._keyset, require=True,
+                            bridge_kid=self._bridge_kid)
+                        d[ce.KEY_REPLAY_VERIFIED] = bool(ok and verified)
+                    except Exception as e:  # noqa: BLE001
+                        # No upgrade rather than no replay: a verifier that cannot
+                        # answer is not grounds to discard a member's history.
+                        _log(f"could not verify a replayed terminal for {gid}: {e!r}")
                 self._groups.on_member_event(d, replay=True)
                 self.rebuilt_members += 1
         except Exception as e:  # noqa: BLE001

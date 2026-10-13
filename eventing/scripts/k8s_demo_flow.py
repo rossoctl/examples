@@ -12,8 +12,24 @@ Stages 2c and 3 are the point. Without them the demo works on the day it is buil
 and fails a week later, which is the worst possible failure mode for something
 whose entire purpose is sitting idle at zero.
 
-  python3 scripts/k8s_demo_flow.py                  # mock mode, free
-  python3 scripts/k8s_demo_flow.py --overlay demo   # real claude
+On `--overlay kind-signed` two more run (#896), which are the talk's D2 beat and the
+one the abstract cannot back without them:
+
+    signed wake        the terminal response carried a signature that VERIFIED, on a
+                       cluster — produced by a runner pod from a Secret-mounted seed and
+                       checked by a bridge pod against a ConfigMap keyset
+    forgery refused    a throwaway pod publishes a correctly-encoded but UNSIGNED
+                       terminal and group.completed onto the responses topic; the batch
+                       does not settle, the genuine answer survives, and the attempt is
+                       on record
+    audit trail        the topic read back with `audit_topic.py --chains`: which events
+                       are signed, and which result answers which signed wake event.
+                       Run AFTER the forgery on purpose — an audit that showed a clean
+                       topic after an attack would be worse than no audit
+
+  python3 scripts/k8s_demo_flow.py                         # mock mode, free
+  python3 scripts/k8s_demo_flow.py --overlay kind-signed   # + the signed beats
+  python3 scripts/k8s_demo_flow.py --overlay demo          # real claude
   python3 scripts/k8s_demo_flow.py --skip-idle-replay
   python3 scripts/k8s_demo_flow.py --skip-cold-continue   # faster, skips 2c
 
@@ -40,6 +56,62 @@ import k8s_preflight  # noqa: E402
 from imagelib import DEFAULT_REGISTRY, DEFAULT_TAG  # noqa: E402
 from k8slib import Kubectl, condition_is, condition_reason, dig, wait_for  # noqa: E402
 from proclib import Checks  # noqa: E402
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from shared import signing  # noqa: E402
+
+# The forgery, run inside a throwaway pod from the eventrunner image (#896). Kept as a
+# module constant rather than inline so it reads as the attacker's program it is.
+#
+# It imports the REAL `shared.ce`, so the events are byte-identical in shape to a
+# genuine publisher's — which is the point: the demo must refuse a correct forgery, not
+# a malformed one. It signs nothing, because an attacker has no approved key; that is
+# precisely what the keyset makes expensive.
+FORGE_SRC = """
+import json, sys
+sys.path.insert(0, "/app")
+from kafka import KafkaProducer
+from shared import ce
+
+GID, CORR = %(gid)r, %(corr)r
+p = KafkaProducer(bootstrap_servers=%(bootstrap)r, acks="all", retries=3)
+
+# 1. A forged terminal for a member that already answered: overwrite the real answer
+#    and fail a healthy agent.
+#
+#    **The sequence is chosen NOT to collide**, which is the opposite of what an
+#    attacker would do and is deliberate. `next_seq` starts at 1, so a forgery at
+#    `sequence=1` always lands on a sequence the genuine run already holds — and #955's
+#    store rule then refuses the rejected row rather than storing it. That is the
+#    STRONGER outcome, but it leaves no row carrying `data.signature_rejected`, so the
+#    "the refusal is on record" half of the beat finds nothing and fails for a reason
+#    that has nothing to do with signing.
+#
+#    So: a high sequence for the recorded beat, and `--forge-collide` on the flow to
+#    demonstrate the collision case separately, where the assertion is that the genuine
+#    row SURVIVES rather than that a rejection was stored.
+member = ce.new_event(
+    type=ce.TYPE_RESPONSE, source="rossoctl://attacker/forge",
+    datacontenttype="application/json", correlationid=CORR,
+    sessionuuid=ce.session_uuid(CORR), sequence=%(seq)d, phase="error", final="true",
+    groupid=GID, data={"text": "Ship the goods", "role": "final"})
+
+# 2. A forged group.completed: end the batch early and page the operator with a
+#    "finished" notification for work that never ran.
+group = ce.new_event(
+    type=ce.TYPE_GROUP_COMPLETED, source="rossoctl://attacker/forge",
+    datacontenttype="application/json", groupid=GID,
+    data={"reason": "all", "finished": 2, "failed": 0})
+
+n = 0
+for evt, key in ((member, CORR), (group, GID)):
+    headers, value = ce.to_kafka_binary(evt)
+    p.send(%(topic)r, key=key.encode(), value=value,
+           headers=[(k, v) for k, v in headers])
+    n += 1
+p.flush(timeout=30)
+print("FORGED", n, "events onto", %(topic)r)
+"""
 
 PREFIX = "flow"
 KAFKA_NS = "kafka"
@@ -70,7 +142,20 @@ class Flow:
         self.ns = args.namespace
         self.base = ""
         self.corr = ""
-        self.mock = args.overlay == "test"
+        # Mock unless the overlay supplies a credential, which only `demo` does
+        # (`eventrunner-demo-patch.yaml` is the one place `ER_MOCK_CLAUDE=false` is set).
+        # This read `args.overlay == "test"`, which was wrong for `kind` before
+        # `kind-signed` existed: the pod auto-detects mock mode with no credential
+        # mounted, while the flow asserted a real-agent reply. Worse than a clean
+        # failure, because the mock reply is `MOCK-REPLY[<prompt>]` and the prompt
+        # contains the expected text — so stage 2's `expect_contains(text, "OK")` could
+        # pass by accident while proving nothing.
+        self.mock = args.overlay != "demo"
+        # #896 — default on for the overlay that enforces signatures, since that is the
+        # only reason `kind-signed` exists. Explicit flags win, so the beats can also be
+        # driven against any other enforcing deployment.
+        self.signed_beats = (args.signed_beats if args.signed_beats is not None
+                             else args.overlay == "kind-signed")
 
     # ---- helpers ----
     def replicas(self) -> int:
@@ -479,6 +564,221 @@ class Flow:
             return self.c.fail(f"POST /continue for {corr}", str(e))
         return self.c.expect(status == 202, f"POST /continue for {corr} -> {status}")
 
+    # ---- the signed path (#896) --------------------------------------------
+    def assert_signed_wake(self) -> None:
+        """D2: the terminal response that ended a run carried a signature that verified.
+
+        The abstract's second demo beat, and until now the only backing for it was a
+        unit test. What makes this different from `test_signing.py` is that the
+        signature was produced by a runner pod from a Secret-mounted seed and checked by
+        a bridge pod against a ConfigMap keyset — the half of the claim no unit test
+        reaches, and the half §4.4 step 2's bug lived in.
+        """
+        self.c.section("signed wake — the terminal response verifies (D2)")
+        try:
+            raw = urllib.request.urlopen(
+                f"{self.base}/v0/agents/{self.corr}/events.jsonl", timeout=15
+            ).read().decode()
+        except (urllib.error.URLError, OSError) as e:
+            return self.c.fail("GET events.jsonl", str(e))
+        events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        terminal = [e for e in events
+                    if str(e.get("final", "false")).lower() == "true"]
+        self.c.expect(bool(terminal), f"a terminal response is stored ({len(events)} events)")
+        if not terminal:
+            return
+        t = terminal[-1]
+        self.c.expect(bool(t.get("signature")),
+                      "the terminal response carries ce_signature",
+                      f"attrs={sorted(k for k in t if not k.startswith('__'))}")
+        # The outcome, not the verdict (§8.5.1). A signature that failed verification
+        # would have been rewritten to phase=error by the consumer, so a terminal still
+        # presenting its own phase is the bridge having accepted it.
+        self.c.expect(t.get("phase") == "result",
+                      "and was ACCEPTED — stored as phase=result, not rewritten to error",
+                      f"phase={t.get('phase')} data={str(t.get('data'))[:160]}")
+        self.c.expect(not t.get("signature_rejected")
+                      and not (t.get("data") or {}).get("signature_rejected"),
+                      "with no rejection marker on the stored row")
+        kid = signing.token_kid(t.get("signature") or "") or "(unnamed)"
+        self.c.note("terminal signed by kid", kid)
+        # §4.4: signing is terminal-only, because a signature costs ~222ms and signing
+        # every stdout frame would add minutes to a chatty run. Worth asserting so the
+        # slide can state the cost honestly rather than implying every frame is signed.
+        signed = [e for e in events if e.get("signature")]
+        self.c.note("signed / total events", f"{len(signed)} / {len(events)} "
+                                             f"(terminal-only by policy, §4.4)")
+
+    def assert_audit_trail(self) -> None:
+        """R4: the broker log read back as an audit trail, after the forgery.
+
+        Runs `audit_topic.py --chains` for the operator-facing view and prints it, then
+        asserts the two facts the abstract's "tamper-evident audit" claim rests on: the
+        genuine run's result chains back to its *signed* wake event, and the forgery is
+        visible rather than indistinguishable.
+
+        Deliberately NOT `--verify`: that asserts a clean topic, and by this point the
+        topic contains the forgery the previous stage published. A demo that needed a
+        clean topic to pass would be a demo that cannot survive its own attack.
+        """
+        self.c.section("audit trail — results chain back to signed wakes (R4)")
+        import contextlib
+        import io
+
+        import audit_topic
+        argv = ["--namespace", self.ns, "--chains",
+                "--registry", self.args.registry, "--tag", self.args.tag]
+        if self.args.kubeconfig:
+            argv += ["--kubeconfig", self.args.kubeconfig]
+        if self.args.context:
+            argv += ["--context", self.args.context]
+        # Captured rather than streamed so the stage can assert on what the operator
+        # sees, then print it — the output IS the artifact this beat produces.
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                audit_topic.main(argv)
+        except SystemExit:
+            pass
+        out = buf.getvalue()
+        print(out.rstrip())
+        self.c.expect("BOUND" in out,
+                      "at least one result chains back to a verified wake event",
+                      out[-400:])
+        self.c.expect("terminals" in out, "the summary reports terminal coverage")
+        # The forgery from the previous stage must still be visible here. An audit tool
+        # that showed a clean topic after an attack would be worse than no tool.
+        self.c.expect("signed-BAD" in out or "UNVERIFIED" in out
+                      or "ORPHANED" in out or "unsigned" in out,
+                      "and the forged event is visible in the audit rather than hidden")
+
+    def assert_forged_event_refused(self) -> None:
+        """The money shot: publish a forgery onto the responses topic and watch it fail.
+
+        Runs from a throwaway pod built on the eventrunner image, which already carries
+        `shared/` and `kafka-python` — so the forgery is encoded by the SAME codec a
+        real attacker would use rather than by a hand-rolled snippet, and it is
+        published from inside the cluster, which is the attacker position the threat
+        model actually describes (§3.3: the broker is plaintext and anything with
+        network access can write to it).
+
+        Asserts the OUTCOME, per §8.5.1 and #885: not that a verdict was computed, but
+        that the batch did not settle and the genuine answer survived.
+        """
+        self.c.section("forged event refused — enforcement acts (#885)")
+        # A batch of 2 with only ONE prompt submitted, so the group stays OPEN: a forged
+        # `group.completed` has something to end prematurely, which is the whole point.
+        try:
+            status, body = get_json(
+                f"{self.base}/v0/groups", method="POST", timeout=60,
+                body=json.dumps({"label": "forgery-target", "expected": 2,
+                                 "prompts": ["Say ok and nothing else."],
+                                 "max_turns": 1}).encode())
+        except (urllib.error.URLError, OSError) as e:
+            return self.c.fail("POST /v0/groups for the forgery target", str(e))
+        gid = (body or {}).get("groupid", "")
+        if not self.c.expect(status == 202 and gid,
+                             f"an OPEN group of 2 created with 1 real member -> {gid}",
+                             f"status={status} body={body}"):
+            return
+        self.c.log(f"  {self.base}/v0/groups/{gid}")
+        done = wait_for(lambda: (self._group_status(gid) or {}).get("terminal", 0) >= 1,
+                        timeout=self.args.turn_timeout, interval=3)
+        self.c.expect(done, f"the genuine member finished ({done.elapsed_s:.0f}s), "
+                            f"so the batch is open with 1 of 2 terminal")
+        st = self._group_status(gid) or {}
+        victim = ((st.get("members") or [{}])[0]).get("correlationid", "")
+        if not self.c.expect(bool(victim), f"the victim correlation is {victim}"):
+            return
+        if not self._publish_forgery(gid, victim):
+            return
+        # Nothing to wait FOR — the assertion is that nothing happened. A few consumer
+        # poll intervals is ample for the events to have been read and decided.
+        time.sleep(20)
+        st = self._group_status(gid) or {}
+        self.c.expect(not st.get("completed_utc"),
+                      "the forged group.completed did NOT settle the batch",
+                      f"completed_utc={st.get('completed_utc')} "
+                      f"terminal={st.get('terminal')} failed={st.get('failed')}")
+        self.c.expect(st.get("failed", 0) == 0,
+                      "and the forged member terminal did NOT fail a healthy member",
+                      f"failed={st.get('failed')} finished={st.get('finished')}")
+        self.c.expect(st.get("finished", 0) == 1,
+                      "the genuine answer still counts as finished",
+                      f"finished={st.get('finished')}")
+        try:
+            raw = urllib.request.urlopen(
+                f"{self.base}/v0/agents/{victim}/events.jsonl", timeout=15
+            ).read().decode()
+            rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        except (urllib.error.URLError, OSError) as e:
+            return self.c.fail("GET the victim's transcript", str(e))
+        self.c.expect(not any("Ship the goods" in json.dumps(r) for r in rows),
+                      "and the forged text is nowhere in the victim's transcript")
+        rejected = [r for r in rows
+                    if (r.get("data") or {}).get("signature_rejected")]
+        if self.args.forge_collide:
+            # The forgery reused a sequence the genuine run holds, so #955's store rule
+            # refused it the row entirely. Nothing to find — and that is the stronger
+            # outcome, so assert THAT rather than the forensic row.
+            self.c.expect(not rejected,
+                          "a forgery reusing a verified row's sequence is refused the "
+                          "row outright (#955) — no rejection is stored because none "
+                          "could be written without destroying the genuine answer")
+            self.c.log("  (--forge-collide: the audit evidence is the surviving "
+                       "genuine row, not a rejection row)")
+        else:
+            self.c.expect(bool(rejected),
+                          f"the refusal is ON RECORD rather than dropped "
+                          f"({len(rejected)} rejected row(s)) — §4.4, a drop is "
+                          f"indistinguishable from an agent that never answered")
+            if rejected:
+                self.c.log(f"  reason: "
+                           f"{(rejected[0].get('data') or {}).get('reason')!r}")
+        logs = self.k.logs("deploy/eventbridge", namespace=self.ns, tail=200) or ""
+        self.c.expect("unverified response" in logs,
+                      "and the bridge logged it, so an operator can see the attempt")
+
+    def _group_status(self, gid: str) -> dict | None:
+        try:
+            _, body = get_json(f"{self.base}/v0/groups/{gid}/status?full=1", timeout=15)
+            return body
+        except (urllib.error.URLError, OSError):
+            return None
+
+    def _publish_forgery(self, gid: str, victim: str) -> bool:
+        """Publish two forgeries from a throwaway in-cluster pod. Returns success.
+
+        The eventrunner image is used because it already carries `shared/` and
+        `kafka-python`, so the events are encoded by the production codec rather than a
+        hand-rolled approximation — the thing that makes this a demo of the real control
+        rather than of a snippet. Publishing from inside the cluster is also the
+        attacker position §3.3 actually describes: the broker is plaintext and anything
+        with network access to it can write.
+        """
+        cfg = self.k.get("configmap", "eventing-config", namespace=self.ns) or {}
+        bootstrap = dig(cfg, "data", "KAFKA_BOOTSTRAP") or \
+            "my-cluster-kafka-bootstrap.kafka.svc:9092"
+        topic = dig(cfg, "data", "RESPONSE_TOPIC") or "kev1-responses"
+        # A sequence the genuine run cannot already hold (next_seq starts at 1), unless
+        # --forge-collide asks for the collision case on purpose.
+        seq = 1 if self.args.forge_collide else 9001
+        forge = FORGE_SRC % {"topic": topic, "gid": gid, "corr": victim,
+                             "bootstrap": bootstrap, "seq": seq}
+        name = f"forger-{int(time.time())}"
+        self.c.log(f"  publishing from a throwaway pod -> {topic} @ {bootstrap}")
+        res = self.k.call(
+            ["run", name, "--rm", "-i", "--restart=Never", "--quiet",
+             "--image", f"{self.args.registry}/rossoctl-eventrunner:{self.args.tag}",
+             "--command", "--", "python", "-c", forge],
+            namespace=self.ns, timeout=240)
+        out = ((res.out or "") + (res.err or "")).strip()
+        ok = res.ok and "FORGED 2" in out
+        self.c.expect(ok, "a throwaway pod published 2 forged events onto the "
+                          "responses topic (in-cluster, production codec)",
+                      out[-500:])
+        return ok
+
     # ---- §21: a group of N agents, tracked ----
     def assert_group(self, n: int) -> None:
         """Launch a group of N agents through the EventBridge API and track it.
@@ -698,7 +998,8 @@ def build_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--namespace", "-n", default=os.environ.get("NS", "kev1"))
-    ap.add_argument("--overlay", default="test", choices=("test", "kind", "demo"))
+    ap.add_argument("--overlay", default="test",
+                    choices=("test", "kind", "kind-signed", "demo"))
     ap.add_argument("--kubeconfig", default=None,
                     help="kubeconfig file (e.g. .kube/config-kind for a Kind cluster)")
     ap.add_argument("--context", default=None)
@@ -726,6 +1027,17 @@ def build_args(argv=None):
                          "(0 = skip)")
     ap.add_argument("--skip-idle-replay", action="store_true",
                     help="skip T5.6, which deletes the consumer group's offsets")
+    ap.add_argument("--signed-beats", dest="signed_beats", action="store_true",
+                    default=None,
+                    help="#896: assert the signed wake (D2) and that a forged event is "
+                         "refused. Default on for --overlay kind-signed")
+    ap.add_argument("--no-signed-beats", dest="signed_beats", action="store_false",
+                    help="skip the signed beats even on an enforcing overlay")
+    ap.add_argument("--forge-collide", action="store_true",
+                    help="publish the forged terminal at sequence 1, colliding with the "
+                         "genuine run's first event. #955's store rule then refuses it "
+                         "the row outright, so the evidence is the surviving genuine "
+                         "answer rather than a stored rejection")
     ap.add_argument("--skip", default="")
     ap.add_argument("--phase", default="pre")
     ap.add_argument("--url", default=None)
@@ -751,6 +1063,14 @@ def main(argv=None) -> int:
     f.stage2()
     f.stage2b()
     f.stage3()
+    # #896 — the signed beats, on by default for `kind-signed` because that overlay
+    # exists for nothing else. `--signed-beats`/`--no-signed-beats` overrides either way,
+    # so the forgery can be demonstrated on any enforcing deployment.
+    if f.signed_beats:
+        f.assert_signed_wake()
+        f.assert_forged_event_refused()
+        f.assert_audit_trail()
+        f.stage3()
     if not args.skip_cold_continue:
         f.stage2c()
         f.stage3()       # and back to zero once more, after the cold turn

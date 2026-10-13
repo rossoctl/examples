@@ -1472,3 +1472,100 @@ def test_the_mirror_verifies_nothing_when_no_keyset_is_configured(svc, monkeypat
     assert m.refused == 0
     assert fresh_store.get_group(gid)["completed_utc"] is not None, \
         "with verification off, replay is unchanged"
+
+
+# ---- a verified terminal outranks an unverified one on replay (#956) --------
+#
+# The residual of #885 the live-path guard cannot reach: the mirror reads the TOPIC, so
+# the rejection marker the consumer writes into SQLite is not available to it, and the
+# mirror does not rebuild response rows either — so the `rejected` column cannot answer
+# the question on an emptyDir restart. Precedence is what is left, and it is enough
+# because the upgrade is one-way.
+
+def _replay_terminal(gid, corr, text, phase, seq, *, verified=False):
+    e = member_event(gid, corr, final=True, phase=phase, text=text, seq=seq)
+    if verified:
+        e[ce.KEY_REPLAY_VERIFIED] = True
+    return e
+
+
+def test_a_verified_terminal_outranks_a_forged_one_earlier_in_the_topic(svc):
+    """#956. A forged terminal lying earlier in the topic than the genuine answer won
+    `finished_utc IS NULL` on every start, so the batch read back `failed: 1` for an
+    agent that had succeeded — and on the test/kind overlays /data is an `emptyDir`, so
+    that replay IS the state rather than a transient.
+    """
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0001", "test-agent-0001"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "Ship the goods", "error", 7),
+                      replay=True)
+    s.on_member_event(_replay_terminal(gid, corr, "Q1 flat", "result", 8, verified=True),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished", \
+        "the verified answer must outrank the forgery whatever order the topic holds"
+    assert m["terminal_phase"] == "result"
+    assert store.group_counts(gid)["failed"] == 0, \
+        "and the batch must not report a failure that never happened"
+
+
+def test_a_forged_terminal_cannot_downgrade_a_verified_one(svc):
+    """The direction that must NOT work, which is what makes precedence safe: the
+    upgrade is one-way, so moving a member needs a valid signature from an approved
+    key — exactly what a forger does not have."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0002", "test-agent-0002"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "Q1 flat", "result", 7, verified=True),
+                      replay=True)
+    s.on_member_event(_replay_terminal(gid, corr, "Ship the goods", "error", 8),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished" and m["terminal_phase"] == "result", \
+        "an unverified terminal must never downgrade a verified one"
+
+
+def test_unsigned_history_replays_exactly_as_before(svc):
+    """**The risk that matters more than the bug.** A forged unsigned terminal and a
+    genuine pre-signing one are byte-identical, so nothing can be refused on replay
+    without refusing the history the mirror exists to rebuild. With no verified
+    terminal in the topic, nothing upgrades and the replay is unchanged."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0003", "test-agent-0003"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "legacy answer", "result", 1),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished" and m["terminal_phase"] == "result", \
+        "pre-signing history must still rebuild"
+    assert store.group_counts(gid)["terminal"] == 1
+
+
+def test_a_genuine_failure_still_reads_as_failed_on_replay(svc):
+    """The false positive to avoid: a real agent failure is an unverified-looking
+    `phase=error` terminal with no genuine answer after it, and it must stay `failed`.
+    Upgrading only happens when a VERIFIED terminal actually arrives."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0004", "test-agent-0004"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "claude exited with code 1",
+                                       "error", 3), replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "failed", "a genuine failure must not be hidden"
+    assert store.group_counts(gid)["failed"] == 1
+
+
+def test_the_replay_verdict_cannot_arrive_from_the_wire(svc):
+    """Same invariant as #885's marker, for the same reason: a verdict this process
+    computed must not be something a publisher can assert."""
+    e = ce.new_event(type=ce.TYPE_RESPONSE, source="s",
+                     datacontenttype="application/json", correlationid="c1",
+                     sequence=1, phase="result", final="true", groupid="g1",
+                     data={"text": "x"})
+    e.attrs[ce.KEY_REPLAY_VERIFIED] = "true"
+    headers, value = ce.to_kafka_binary(e)
+    assert not [k for k, _ in headers if "__" in k]
+    back = ce.from_kafka_binary(headers, value)
+    assert not back.get(ce.KEY_REPLAY_VERIFIED), \
+        "a replay verdict must not be forgeable on the wire"

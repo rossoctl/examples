@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS group_members (
   first_event_utc TEXT,
   finished_utc    TEXT,
   terminal_phase  TEXT,             -- result | error
+  -- #956 — was the terminal that set `status` carried by a VERIFIED event? Defaults to
+  -- 0, which is truthful for every row written before this column and for every
+  -- unsigned deployment: nothing has been proved about them. Only ever moves 0 -> 1
+  -- (`upgrade_member_terminal`), so it cannot be used to downgrade a genuine answer.
+  verified        INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (groupid, correlationid)
 );
 -- What lets the responses consumer answer "does this event belong to a group?" with a
@@ -120,6 +125,11 @@ class Store:
         try:
             self._r.execute(
                 "ALTER TABLE responses ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._s.execute(
+                "ALTER TABLE group_members ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         self._lock = threading.Lock()
@@ -374,19 +384,57 @@ class Store:
                 (_now_iso(), groupid, correlationid))
 
     def mark_member_finished(self, groupid: str, correlationid: str,
-                             terminal_phase: str) -> bool:
+                             terminal_phase: str, *, verified: bool = False) -> bool:
         """Record a member's terminal event. Returns True only on the FIRST call.
 
         `finished_utc IS NULL` makes this idempotent by construction, which is the
         whole §21.5 correction: a redelivered request re-runs the agent and emits a
         second final event, and this must not count twice.
+
+        `verified` records whether the terminal that set this row carried a signature
+        that checked out, so a later replay cannot regress it (#956,
+        `upgrade_member_terminal`). It defaults to False because most callers have no
+        verdict to offer — an unsigned deployment, or the mirror replaying history —
+        and "nothing has been proved about this row" is the truthful default.
         """
         status = "failed" if terminal_phase == "error" else "finished"
         with self._lock:
             cur = self._s.execute(
-                "UPDATE group_members SET status=?, finished_utc=?, terminal_phase=? "
+                "UPDATE group_members SET status=?, finished_utc=?, terminal_phase=?, "
+                "verified=? "
                 "WHERE groupid=? AND correlationid=? AND finished_utc IS NULL",
-                (status, _now_iso(), terminal_phase, groupid, correlationid))
+                (status, _now_iso(), terminal_phase, 1 if verified else 0,
+                 groupid, correlationid))
+            return cur.rowcount == 1
+
+    def upgrade_member_terminal(self, groupid: str, correlationid: str,
+                                terminal_phase: str) -> bool:
+        """Let a VERIFIED terminal outrank an unverified one already recorded. #956.
+
+        The replay counterpart to `mark_member_finished`, and the reason it has to
+        exist: the group mirror reads the topic rather than the store, so the
+        `ce.KEY_REJECTED` marker the live consumer writes is not available to it, and a
+        forged terminal lying earlier in the topic than the genuine answer wins the
+        `finished_utc IS NULL` race on every start. On the `test`/`kind` overlays /data
+        is an `emptyDir`, so that replay IS the state and a batch reads back
+        `failed: 1` for an agent that succeeded.
+
+        **Precedence rather than refusal, because refusal is not available here.** A
+        forged unsigned terminal and a genuine pre-signing one are byte-identical, so
+        nothing can be rejected on replay without rejecting the history the mirror
+        exists to rebuild. Instead the verdict only ever moves a member in one
+        direction — unverified to verified — which a forger cannot use, since moving a
+        member would require a valid signature from an approved key.
+
+        `verified=0` in the WHERE is what makes it one-way: a verified terminal is
+        never downgraded by a later unverified one, which is the live path's rule too.
+        """
+        status = "failed" if terminal_phase == "error" else "finished"
+        with self._lock:
+            cur = self._s.execute(
+                "UPDATE group_members SET status=?, terminal_phase=?, verified=1 "
+                "WHERE groupid=? AND correlationid=? AND verified=0",
+                (status, terminal_phase, groupid, correlationid))
             return cur.rowcount == 1
 
     def group_of(self, correlationid: str) -> str | None:
