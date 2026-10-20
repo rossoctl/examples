@@ -9,6 +9,6 @@ dependencies = [
     "authlib>=1.7.2",   # Indirect; prevents CVE-2026-27962
     "urllib3>=2.7.0",   # Indirect; prevents CVE-2025-66418
     "fastmcp>=3.4.4",           # Indirect; prevents CVE-2026-32871 (critical), CVE-2026-27124 (high)
-    "cryptography>=49.0.0,<50", # Indirect; prevents CVE-2026-26007
+    "cryptography>=49.0.0,<51", # Indirect; prevents CVE-2026-26007
     "pyjwt>=2.13.0",            # Indirect; prevents CVE-2026-32597
 ]
